@@ -1,0 +1,48 @@
+# The single compose file for every service. Run it from this directory:
+#
+#   docker compose up --build -d          start the stack
+#   docker compose run --rm api-tests     run the test suite inside the image
+#   docker compose logs -f api            follow the api log
+#   docker compose down                   stop and remove
+#
+# Compose auto-loads ./.env from this directory for the ${...} substitutions
+# below, so no --env-file flag is needed. Values reaching a container are listed
+# explicitly under `environment:` rather than injected wholesale, so this file
+# stays an accurate description of what each service actually reads.
+#
+# Two services join later, and both slot in here without restructuring:
+#   web    — builds the React bundle (deploy/web.Dockerfile) into a shared volume
+#   caddy  — publishes 80/443, terminates TLS, serves the bundle, proxies /api/*
+# At that point `api` loses its `ports:` block, since Caddy becomes the only way
+# in and the API is reachable only on this network as `api:8000`.
+
+name: aws-chatbot
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+      target: runtime
+    image: aws-chatbot-api:local
+    restart: unless-stopped
+    environment:
+      # `-` rather than `:-`: an explicitly empty value in .env must survive as
+      # empty (that is how CORS is switched off) instead of falling back here.
+      CHAT_CORS_ALLOW_ORIGINS: ${CHAT_CORS_ALLOW_ORIGINS-http://localhost:5173,http://127.0.0.1:5173}
+      CHAT_MAX_PROMPT_CHARS: ${CHAT_MAX_PROMPT_CHARS:-4000}
+      CHAT_WORD_DELAY_SECONDS: ${CHAT_WORD_DELAY_SECONDS:-0.06}
+    ports:
+      # Temporary: direct access for testing. Removed once Caddy fronts the API.
+      - "${API_HOST_PORT:-8000}:8000"
+    # The healthcheck is defined in the image, so it needs no repeating here.
+
+  api-tests:
+    # Behind a profile, so `docker compose up` never starts it. Reached with
+    # `docker compose run --rm api-tests`, optionally with pytest arguments.
+    profiles: ["test"]
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+      target: test
+    image: aws-chatbot-api-tests:local

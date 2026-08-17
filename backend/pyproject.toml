@@ -1,0 +1,51 @@
+[project]
+name = "aws-chatbot-api"
+version = "0.1.0"
+description = "Streaming chat API — Clean Architecture, FastAPI, Server-Sent Events."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "pydantic>=2.9,<3.0",
+    "uvicorn[standard]>=0.30,<1.0",
+]
+
+# Managed with uv. Runtime deps above are the single source of truth; the api
+# image installs them with `uv sync --locked --no-default-groups`, which excludes
+# every group below. Note --no-dev would exclude only `dev` and still install
+# `lint`, since default-groups names both. Commit uv.lock so every environment
+# resolves identically.
+[dependency-groups]
+dev = [
+    "httpx2>=2.10.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+]
+lint = [
+    "mypy>=1.11",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+# An application, not a library: uv installs the dependencies but does not build
+# or install this project itself, so no build backend is needed.
+package = false
+default-groups = ["dev", "lint"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "ASYNC", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true

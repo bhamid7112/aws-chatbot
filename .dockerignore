@@ -1,0 +1,42 @@
+# Build context is the repo root so one compose file can build every service.
+# That makes pruning the context important: everything below would otherwise be
+# uploaded to the daemon on each build.
+
+# Version control
+.git
+.gitignore
+.dockerignore
+
+# Secrets must never enter an image layer
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+
+# Python
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/.coverage
+**/htmlcov
+
+# Node — installed inside the image, never copied in
+**/node_modules
+frontend/dist
+
+# Infrastructure state is irrelevant to any image
+infra/.terraform
+**/*.tfstate
+**/*.tfstate.*
+**/*.tfvars
+
+# Editors, OS, logs
+.vscode
+.idea
+**/.DS_Store
+**/Thumbs.db
+**/*.log
