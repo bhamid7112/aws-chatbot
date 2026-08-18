@@ -62,7 +62,7 @@ cd infra
 Copy-Item terraform.tfvars.example terraform.tfvars   # then edit acme_email
 terraform init
 terraform validate
-terraform plan          # read it: 17 resources to add, none destroyed
+terraform plan          # read it: 16 resources to add, none destroyed
 terraform apply
 ```
 
@@ -71,7 +71,7 @@ still installing Docker, building two images and requesting a certificate, which
 takes roughly 5–10 minutes on a t3.micro. Watch it:
 
 ```powershell
-terraform output -raw bootstrap_log_command    # copy and run the printed command
+terraform output -raw deploy_log_command    # copy and run the printed command
 ```
 
 The log ends with `=== bootstrap finished` and a `docker compose ps` listing both
@@ -161,9 +161,11 @@ deployment is the one way this costs money while doing nothing.
 | Certificate never issues | `sudo docker compose logs caddy` in `/opt/aws-chatbot/deploy`. Check port 80 reachability from outside first. |
 | Site works, then dies about a week later | A renewal failed. Port 80 closed after issuance is the usual cause. |
 | Reply arrives all at once instead of word by word | Buffering between browser and API. `flush_interval -1` is already set on the reverse proxy; check nothing else (a corporate proxy, a CDN) sits in front. |
+| `compose build requires buildx 0.17.0 or later` | The buildx plugin is missing or too old. `user_data` installs it; if it could not reach `api.github.com` to resolve the latest tag, pin `docker_buildx_version` (e.g. `v0.36.1`). |
 | Deploy log ends at a git error | `fatal: could not read Username` means the repository is no longer public. `couldn't find remote ref` means `git_ref` names something that was never pushed. |
 | A release ships nothing new | The commit was not pushed. `git -C /opt/aws-chatbot log -1` on the instance shows exactly what is deployed. |
 | `npm run build` killed during a release | Swap missing or too small. `swapon --show` on the instance; raise `swap_size_gb`, or move to `t3.small`. |
+| `Invalid force-replace address` / `Invalid target` from PowerShell | PowerShell mangles unquoted `-flag=value` arguments (`-replace` and `-target` are also its own operators). Quote them: `terraform apply "-replace=aws_instance.app"`. |
 | Plan wants to replace the instance | Read it carefully before agreeing — a replacement loses the certificate and the image cache. An `ami` change should never appear (it is ignored); a `user_data` change means a stop/start, not a replacement. |
 
 ## Known limits

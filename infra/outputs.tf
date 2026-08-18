@@ -25,25 +25,30 @@ output "deployed_source" {
 
 output "ssm_session_command" {
   description = "Open a root-capable shell on the instance. There is no SSH and no key pair; this is the only way in."
-  value       = "aws ssm start-session --target ${aws_instance.app.id} --region ${var.aws_region}"
+  value       = "aws ssm start-session --target ${aws_instance.app.id} --region ${var.aws_region}${local.cli_profile_flag}"
 }
 
 output "redeploy_command" {
   description = "Ship the current head of the deployed ref: re-runs the same script user_data ran at first boot. Push first; Terraform is not involved in a release."
+  # Arguments containing `=` are quoted so the command survives being pasted into
+  # PowerShell, which mangles some unquoted `flag=value` tokens.
   value = join(" ", [
     "aws ssm send-command",
     "--document-name AWS-RunShellScript",
-    "--targets Key=InstanceIds,Values=${aws_instance.app.id}",
-    "--parameters commands=/usr/local/bin/aws-chatbot-deploy",
-    "--region ${var.aws_region}",
+    "--targets \"Key=InstanceIds,Values=${aws_instance.app.id}\"",
+    "--parameters \"commands=/usr/local/bin/aws-chatbot-deploy\"",
+    "--region ${var.aws_region}${local.cli_profile_flag}",
   ])
 }
 
-output "bootstrap_log_command" {
-  description = "Follow the first boot from a local terminal. Certificate issuance is 30-60s after the stack starts."
+output "deploy_log_command" {
+  description = "Follow the bootstrap and every release from a local terminal. Certificate issuance is 30-60s after the stack starts."
+  # Both logs, and -F rather than -f: on first boot the deploy log does not exist
+  # until moments later, and -F waits for a file to appear instead of giving up on
+  # it. So the same command works for the first boot and for the tenth release.
   value = join(" ", [
-    "aws ssm start-session --target ${aws_instance.app.id} --region ${var.aws_region}",
+    "aws ssm start-session --target ${aws_instance.app.id} --region ${var.aws_region}${local.cli_profile_flag}",
     "--document-name AWS-StartInteractiveCommand",
-    "--parameters command='sudo tail -f /var/log/aws-chatbot-bootstrap.log'",
+    "--parameters \"command='sudo tail -F /var/log/aws-chatbot-bootstrap.log /var/log/aws-chatbot-deploy.log'\"",
   ])
 }

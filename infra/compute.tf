@@ -39,6 +39,11 @@ resource "aws_instance" "app" {
     site_address       = aws_eip.web.public_ip
     swap_size_gb       = var.swap_size_gb
     docker_compose_url = local.docker_compose_url
+
+    # Passed through rather than resolved into a URL here: the buildx asset's
+    # filename embeds its version, so an empty value has to be resolved on the
+    # instance at boot.
+    docker_buildx_version = var.docker_buildx_version
   })
 
   # Changing user_data must not build a new host: this one holds the Elastic IP,

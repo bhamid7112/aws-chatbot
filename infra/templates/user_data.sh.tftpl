@@ -51,7 +51,38 @@ curl -fsSL --retry 5 --retry-delay 3 \
   -o /usr/local/lib/docker/cli-plugins/docker-compose \
   "${docker_compose_url}"
 chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+
+# buildx, and it is not optional: `docker compose up --build` delegates the build
+# to buildx and refuses to run without 0.17.0 or later, so a stack that only has
+# the compose plugin fails at the build step with
+# "compose build requires buildx 0.17.0 or later". Amazon Linux 2023 packages the
+# Docker engine without it. The Dockerfiles' `# syntax=docker/dockerfile:1` lines
+# need BuildKit for the same reason.
+#
+# /usr/local/lib comes before /usr/libexec in the plugin search path, so this copy
+# wins over any the distribution might add later.
+echo "--- installing the docker buildx plugin"
+buildx_version=${docker_buildx_version}
+if [[ -z "$buildx_version" ]]; then
+  # Unlike compose, the buildx asset's *filename* contains its version, so
+  # `releases/latest/download/<name>` cannot address it — the tag has to be
+  # resolved before the URL can be built.
+  buildx_version=$(curl -fsSL --retry 3 --retry-delay 3 \
+    https://api.github.com/repos/docker/buildx/releases/latest \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+fi
+if [[ -z "$buildx_version" ]]; then
+  echo "FATAL: could not resolve a buildx version to install." >&2
+  echo "Set docker_buildx_version in terraform.tfvars to pin one explicitly." >&2
+  exit 1
+fi
+curl -fsSL --retry 5 --retry-delay 3 \
+  -o /usr/local/lib/docker/cli-plugins/docker-buildx \
+  "https://github.com/docker/buildx/releases/download/$buildx_version/buildx-$buildx_version.linux-amd64"
+chmod 0755 /usr/local/lib/docker/cli-plugins/docker-buildx
+
 docker compose version
+docker buildx version
 
 # ── the deploy command ────────────────────────────────────────────────────────
 # Quoted heredoc: nothing below is expanded by *this* shell. Terraform has

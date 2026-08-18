@@ -180,3 +180,24 @@ variable "docker_compose_version" {
     error_message = "docker_compose_version must be empty or a release tag like v2.40.0."
   }
 }
+
+variable "docker_buildx_version" {
+  description = <<-EOT
+    buildx plugin version to install, as a release tag such as "v0.36.1".
+
+    Required, not optional tooling: `docker compose up --build` hands the build to
+    buildx and refuses to run with anything older than 0.17.0, and Amazon Linux
+    2023 packages the Docker engine without it. Empty means the instance resolves
+    the latest release tag from the GitHub API at boot — necessary because the
+    buildx asset's filename embeds its version, so there is no fixed "latest" URL
+    to fetch the way there is for compose. Pin a tag when a deployment needs to be
+    reproducible, or when the instance cannot reach api.github.com.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.docker_buildx_version == "" || can(regex("^v[0-9]+\\.[0-9]+\\.[0-9]+$", var.docker_buildx_version))
+    error_message = "docker_buildx_version must be empty or a release tag like v0.36.1."
+  }
+}
