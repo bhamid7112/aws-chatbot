@@ -1,0 +1,136 @@
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3125rem;
+  animation: turn-in 180ms ease-out;
+}
+
+.turn--machine {
+  align-items: flex-start;
+  max-width: min(58ch, 100%);
+}
+
+.turn--human {
+  align-self: flex-end;
+  align-items: flex-end;
+  max-width: min(46ch, 100%);
+}
+
+.turn__meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-family: var(--font-machine);
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.turn--human .turn__meta {
+  flex-direction: row-reverse;
+}
+
+.turn__time {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+
+.turn__text {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* ── the machine's tape ─────────────────────────────────────────────────────
+   Square and perforated on the leading edge, because that edge came off a roll. */
+.turn--machine .turn__surface {
+  position: relative;
+  margin-left: var(--sprocket);
+  padding: 0.6875rem 1rem 0.75rem;
+  border: 1px solid var(--rule);
+  border-left: none;
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--tape);
+  font-family: var(--font-machine);
+  font-size: var(--text-machine);
+  line-height: 1.5;
+}
+
+.turn--machine .turn__surface::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 calc(-1 * var(--sprocket));
+  width: var(--sprocket);
+  border: 1px solid var(--rule);
+  border-right: none;
+  border-radius: var(--radius) 0 0 var(--radius);
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0 6px,
+    var(--wire-faint) 6px 10px
+  );
+}
+
+/* ── the person's note ─────────────────────────────────────────────────────── */
+.turn--human .turn__surface {
+  padding: 0.5625rem 0.875rem;
+  border-radius: var(--radius);
+  border-right: 2px solid var(--note-edge);
+  background: var(--note);
+  font-size: var(--text-human);
+}
+
+/* ── the printing carriage ─────────────────────────────────────────────────── */
+.turn__caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1.05em;
+  margin-left: 0.09em;
+  vertical-align: -0.15em;
+  background: var(--wire);
+  animation: turn-caret 1.05s steps(1, end) infinite;
+}
+
+.turn__fault {
+  font-family: var(--font-machine);
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--fault);
+}
+
+.turn--machine .turn__fault {
+  border-left: 2px solid var(--fault);
+  padding-left: 0.5rem;
+  margin-left: var(--sprocket);
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: var(--text-meta);
+}
+
+.turn[data-status='interrupted'] .turn__surface {
+  border-color: var(--fault);
+}
+
+/* A message that never left the browser: the ochre margin the person's own
+   words normally carry is replaced by the fault colour. */
+.turn[data-status='rejected'] .turn__surface {
+  border-right-color: var(--fault);
+  opacity: 0.75;
+}
+
+@keyframes turn-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* Base state is a solid block, so switching the animation off leaves the caret
+   visible rather than mid-blink. */
+@keyframes turn-caret {
+  50% {
+    opacity: 0;
+  }
+}

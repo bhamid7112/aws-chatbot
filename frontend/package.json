@@ -1,0 +1,27 @@
+{
+  "name": "aws-chatbot-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Streaming chat UI — Clean Architecture, React, Server-Sent Events.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "check:layers": "node scripts/check-layers.mjs",
+    "check": "npm run check:layers && npm run typecheck"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  }
+}

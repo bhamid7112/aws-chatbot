@@ -1,0 +1,50 @@
+.opening {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3125rem;
+  align-items: flex-start;
+  max-width: min(58ch, 100%);
+}
+
+.opening__label {
+  font-family: var(--font-machine);
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+/* No perforated margin here, unlike a printed length of tape: this stub is still
+   blank, and the missing sprocket edge is the difference. */
+.opening__tape {
+  position: relative;
+  display: block;
+  width: min(24ch, 100%);
+  height: 2.375rem;
+  border: 1px dashed var(--rule);
+  border-radius: var(--radius);
+  background: var(--tape);
+  overflow: hidden;
+}
+
+.opening__carriage {
+  position: absolute;
+  top: 0.6875rem;
+  left: 1rem;
+  width: 0.5rem;
+  height: 1rem;
+  background: var(--wire);
+  animation: opening-scan 1.4s ease-in-out infinite;
+}
+
+@keyframes opening-scan {
+  0%,
+  100% {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  50% {
+    transform: translateX(9rem);
+    opacity: 0.45;
+  }
+}

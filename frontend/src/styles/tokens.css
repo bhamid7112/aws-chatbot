@@ -1,0 +1,49 @@
+/*
+ * The design tokens, and the reasoning behind them.
+ *
+ * The subject decides the palette: this is an instrument that prints a reply one
+ * word at a time onto a strip of tape, reached at a bare IP address. So the
+ * ground is cool plotter grey, the machine writes on near-white tape in
+ * verdigris, and the person's own words sit on a warm note. Nothing else earns a
+ * colour — errors get the one remaining hue and use it once.
+ *
+ * Two faces, two voices. The monospace is not a code font here; it is the
+ * machine's handwriting, and it carries the display role: the address, the
+ * labels, the readout, the assistant's words. The humanist sans is reserved for
+ * what a person wrote or is about to write.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces and ink */
+  --paper: #dfe4e9; /* the ground the instrument sits on */
+  --shell: #eceff2; /* the instrument face */
+  --tape: #fbfcfd; /* machine tape */
+  --note: #f2e6d2; /* a person's note */
+  --ink: #14181e;
+  --slate: #58616f; /* labels, timestamps, anything secondary */
+  --rule: #c9cfd6;
+
+  /* Signal */
+  --wire: #0a7a6c; /* verdigris: ticks, caret, focus, the send key */
+  --wire-faint: #0a7a6c26;
+  --note-edge: #b26414; /* ochre: the human margin */
+  --fault: #a8412a;
+
+  --font-machine: 'Cascadia Code', ui-monospace, 'JetBrains Mono', 'SF Mono',
+    Menlo, Consolas, monospace;
+  --font-human: 'Segoe UI Variable Text', 'Segoe UI', -apple-system,
+    BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif;
+
+  /* A five-step scale, no more. 11 / 13 / 15 / 17 / 22 */
+  --text-label: 0.6875rem;
+  --text-meta: 0.8125rem;
+  --text-human: 0.9375rem;
+  --text-machine: 1.0625rem;
+  --text-address: 1.375rem;
+
+  --track-label: 0.14em; /* labels are spaced; nothing else is */
+  --radius: 3px;
+  --sprocket: 13px; /* width of the tape's perforated margin */
+}

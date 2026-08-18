@@ -1,0 +1,124 @@
+/* A single column with a fixed head and foot; only the transcript scrolls. The
+   hairline down each side turns the column into an instrument face rather than a
+   page, and disappears once the viewport is the whole width anyway. */
+.shell {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  max-width: 62rem;
+  /* height, not min-height: the middle row must be *capped* at the viewport,
+     otherwise 1fr resolves to max-content and a long message grows the page
+     instead of scrolling the transcript. */
+  height: 100dvh;
+  margin: 0 auto;
+  background: var(--shell);
+  border-inline: 1px solid var(--rule);
+}
+
+.head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 1.125rem 1.25rem 0.875rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.head__identity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.head__eyebrow {
+  font-family: var(--font-machine);
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+/* The address is the wordmark: this deployment has no domain and no other name,
+   so the thing it is reached at is the thing it is called. */
+.head__address {
+  font-family: var(--font-machine);
+  font-size: var(--text-address);
+  letter-spacing: -0.015em;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.head__scheme {
+  font-size: var(--text-meta);
+  letter-spacing: 0;
+  color: var(--slate);
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: 1.125rem;
+  padding: 1.25rem;
+  min-height: 0;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+}
+
+.transcript__lift {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.transcript__empty {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  max-width: 40ch;
+}
+
+.transcript__empty-label {
+  font-family: var(--font-machine);
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+/* The machine's face, like every other word the interface itself says. The
+   humanist face is reserved for what a person typed — that is the whole of the
+   distinction between the two voices. */
+.transcript__empty-line {
+  font-family: var(--font-machine);
+  font-size: var(--text-machine);
+  line-height: 1.45;
+  color: var(--slate);
+}
+
+.foot {
+  border-top: 1px solid var(--rule);
+}
+
+.foot__notice {
+  margin: 0.875rem 1.25rem 0;
+  padding-left: 0.5rem;
+  border-left: 2px solid var(--fault);
+  font-family: var(--font-machine);
+  font-size: var(--text-meta);
+  color: var(--fault);
+}
+
+@media (max-width: 46rem) {
+  .shell {
+    border-inline: none;
+  }
+
+  .head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.875rem;
+  }
+
+  .transcript {
+    padding: 1rem;
+  }
+}

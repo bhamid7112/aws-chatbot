@@ -1,0 +1,71 @@
+.wire {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--tape);
+  font-family: var(--font-machine);
+}
+
+.wire__label {
+  font-size: var(--text-label);
+  letter-spacing: var(--track-label);
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.wire__endpoint {
+  font-family: inherit;
+  font-size: var(--text-meta);
+  color: var(--ink);
+  justify-self: start;
+}
+
+.wire__ticks {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.wire__tick {
+  width: 3px;
+  height: 11px;
+  background: var(--rule);
+}
+
+.wire__tick--lit {
+  background: var(--wire);
+  animation: wire-tick 140ms ease-out;
+}
+
+.wire__status {
+  grid-column: 1 / -1;
+  font-size: var(--text-label);
+  letter-spacing: 0.02em;
+  color: var(--slate);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The two states worth colouring, and no others. */
+.wire[data-state='receiving'] .wire__status {
+  color: var(--wire);
+}
+
+.wire[data-state='failed'] .wire__status {
+  color: var(--fault);
+}
+
+.wire[data-state='failed'] .wire__tick--lit {
+  background: var(--fault);
+}
+
+@keyframes wire-tick {
+  from {
+    transform: scaleY(0.2);
+    opacity: 0.4;
+  }
+}
