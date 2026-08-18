@@ -1,0 +1,60 @@
+# Copy to terraform.tfvars and edit. That filename is gitignored: it carries an
+# email address, and often a region and CIDRs that say something about where and
+# how a deployment runs.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# acme_email is the only variable without a default — everything else below is
+# shown at its default value, so an uncommented line is a deliberate change.
+
+# Required. A real, deliverable address: Let's Encrypt has no other way to warn
+# you about a renewal that has started failing, and these certificates last about
+# six days.
+acme_email = "you@example.com"
+
+# The region the Elastic IP — and therefore the certificate's identity — lives in.
+# aws_region = "us-west-1"
+
+# Named profile from ~/.aws/config. Empty uses the ambient credential chain. Set
+# it if this machine has profiles for more than one account: it makes the target
+# account a reviewable part of the configuration rather than a property of the
+# shell that happened to run apply. For an IAM Identity Center profile, refresh
+# the session first with `aws sso login --profile <name>`.
+# aws_profile = ""
+
+# Where the instance gets the application. Cloning needs no credentials because
+# the repository is public, which is what removes the artifact bucket entirely —
+# so making it private breaks the next redeploy until a deploy token is arranged.
+# repo_url = "https://github.com/bhamid7112/aws-chatbot.git"
+
+# Branch, tag or commit SHA to deploy. A branch means "whatever was last pushed";
+# a tag or SHA pins the release. All three work.
+# git_ref = "main"
+
+# Free-tier eligible and enough to serve this application. Raise to t3.small if
+# the Vite build on the instance is slow enough to be annoying.
+# instance_type = "t3.micro"
+
+# Name prefix and Project tag for every resource created here.
+# project = "aws-chatbot"
+
+# Root volume, in GiB. Holds the OS, both build contexts and Docker's image
+# cache, so it is sized for repeated rebuilds rather than one image.
+# root_volume_size_gb = 20
+
+# Swapfile created on first boot, so `npm run build` cannot be OOM-killed.
+# swap_size_gb = 2
+
+# Who may reach ports 80 and 443. Note that port 80 cannot usefully be narrowed
+# even for a private deployment: Let's Encrypt validates HTTP-01 from its own
+# unpublished source addresses, and a blocked validation means no certificate.
+# allowed_web_cidrs = ["0.0.0.0/0"]
+
+# Empty means the latest Compose release. Pin a tag such as "v2.40.0" when a
+# deployment needs to be reproducible rather than current.
+# docker_compose_version = ""
+
+# The VPC is created and destroyed with the deployment, so these only matter if
+# they collide with something you intend to peer with.
+# vpc_cidr           = "10.0.0.0/16"
+# public_subnet_cidr = "10.0.1.0/24"

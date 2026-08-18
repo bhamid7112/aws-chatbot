@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# First-boot bootstrap for the ${app_dir} host, rendered by Terraform from
+# infra/templates/user_data.sh.tftpl. Every $${...} in the source template was
+# substituted at plan time, so the copy on the instance contains no template
+# syntax and can be read as an ordinary script.
+#
+# cloud-init runs this once, as root, on first boot only — never again, not even
+# after a reboot. The stack comes back after a reboot because Docker is enabled
+# as a service and every container is `restart: unless-stopped`, not because
+# anything re-runs this file.
+#
+# Structure: this script installs the machine's prerequisites, then writes
+# /usr/local/bin/aws-chatbot-deploy and runs it. Splitting it that way means the
+# thing that starts the application is a command on the box, so recovering from a
+# failed bootstrap — or shipping a new release later — is one idempotent command
+# over SSM rather than a re-created instance.
+set -euo pipefail
+
+exec > >(tee -a /var/log/aws-chatbot-bootstrap.log) 2>&1
+echo "=== bootstrap starting at $(date -Is) ==="
+
+# ── swap ──────────────────────────────────────────────────────────────────────
+# `npm run build` peaks well above what a t3.micro's 1 GiB leaves free, and the
+# OOM killer takes node mid-build: the deploy fails with a non-obvious error and
+# no bundle. Swap is slow, and that is fine — it is touched during a build and
+# essentially never while serving.
+if [[ ! -f /swapfile ]]; then
+  echo "--- creating a ${swap_size_gb} GiB swapfile"
+  dd if=/dev/zero of=/swapfile bs=1M count=$(( ${swap_size_gb} * 1024 )) status=none
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  # Survives a reboot, which the running `swapon` above would not.
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# ── packages ──────────────────────────────────────────────────────────────────
+echo "--- installing docker and git"
+dnf install -y docker git
+
+systemctl enable --now docker
+
+# Amazon Linux 2023 packages the Docker engine but not the Compose plugin, so it
+# is fetched as a CLI plugin binary. /usr/local/lib is the documented location for
+# a manually installed plugin and keeps `docker compose` working as a subcommand
+# rather than a separate tool.
+echo "--- installing the docker compose plugin"
+install -d -m 0755 /usr/local/lib/docker/cli-plugins
+curl -fsSL --retry 5 --retry-delay 3 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose \
+  "${docker_compose_url}"
+chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+docker compose version
+
+# ── the deploy command ────────────────────────────────────────────────────────
+# Quoted heredoc: nothing below is expanded by *this* shell. Terraform has
+# already substituted its own values, so what lands in the file is literal. The
+# script creates ${app_dir} itself, so nothing needs to exist beforehand.
+cat > /usr/local/bin/aws-chatbot-deploy <<'DEPLOY'
+#!/usr/bin/env bash
+#
+# Pull the current source from git and (re)start the stack. Written by user_data;
+# safe to re-run at any time, and re-running it is exactly what a redeploy does:
+#
+#   aws ssm send-command \
+#     --document-name AWS-RunShellScript \
+#     --targets Key=InstanceIds,Values=<instance-id> \
+#     --parameters commands=/usr/local/bin/aws-chatbot-deploy
+#
+# One code path starts this application, whether that is first boot or the tenth
+# release.
+set -euo pipefail
+
+exec > >(tee -a /var/log/aws-chatbot-deploy.log) 2>&1
+echo "=== deploy starting at $(date -Is) ==="
+
+app_dir=${app_dir}
+repo_url=${repo_url}
+git_ref=${git_ref}
+expected_ip=${site_address}
+
+# Fetched by ref into a repository initialised in place, rather than `git clone`:
+# `clone --branch` takes a branch or a tag but not a commit SHA, whereas
+# `fetch origin <ref>` takes all three — so pinning a release to an exact revision
+# needs no second code path. --depth 1 because this is a build input, not a
+# history anyone will read on the instance.
+#
+# No credentials anywhere: the repository is public over HTTPS, which is the whole
+# reason there is no artifact bucket and no S3 grant on the instance role.
+if [[ ! -d "$app_dir/.git" ]]; then
+  echo "--- initialising $app_dir from $repo_url"
+  rm -rf "$app_dir"
+  install -d -m 0755 "$app_dir"
+  git -C "$app_dir" init -q
+  git -C "$app_dir" remote add origin "$repo_url"
+fi
+
+echo "--- fetching $git_ref"
+git -C "$app_dir" fetch --depth 1 origin "$git_ref"
+git -C "$app_dir" reset --hard FETCH_HEAD
+
+# -fd, and deliberately not -x. A file deleted upstream must not survive into the
+# next build, or the image is assembled from a mixture of two releases — a fault
+# that is very hard to read from the outside. But .env below is gitignored, and -x
+# would delete it and take the site down at the next restart.
+git -C "$app_dir" clean -fd
+
+echo "--- deploying $(git -C "$app_dir" log -1 --format='%h %s')"
+
+# This file is the entire deployment-specific surface: docker-compose.yml reads
+# it, and the Caddyfile's behaviour follows from SITE_ADDRESS alone. It is
+# gitignored, so the working tree above never contains one and never overwrites
+# this.
+#
+# CHAT_CORS_ALLOW_ORIGINS is deliberately empty rather than absent. Caddy makes
+# the browser's origin and the API's origin the same one, so there is no
+# cross-origin request to permit — and compose's `$${VAR-default}` treats an
+# explicitly empty value as set, which is how CORS is switched off.
+umask 077
+cat > "$app_dir/deploy/.env" <<'ENV'
+SITE_ADDRESS=${site_address}
+ACME_EMAIL=${acme_email}
+CHAT_CORS_ALLOW_ORIGINS=
+ENV
+umask 022
+
+# ── wait for the Elastic IP ───────────────────────────────────────────────────
+# The instance boots with an auto-assigned public address and Terraform
+# associates the Elastic IP moments later. Starting Caddy inside that window
+# means asking Let's Encrypt for a certificate naming an address that does not yet
+# reach this host: validation fails, and the failure is charged against the
+# account's rate limit. With a six-day certificate there is no spare quota for
+# repeating that mistake, so this waits instead.
+echo "--- waiting for the public IPv4 to be $expected_ip"
+for attempt in $(seq 1 60); do
+  # A token per iteration rather than one for the whole loop: IMDSv2 tokens
+  # expire, and the loop can run for minutes.
+  token=$(curl -fsS --max-time 5 -X PUT http://169.254.169.254/latest/api/token \
+            -H 'X-aws-ec2-metadata-token-ttl-seconds: 120' || true)
+  current=$(curl -fsS --max-time 5 -H "X-aws-ec2-metadata-token: $token" \
+            http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+
+  if [[ "$current" == "$expected_ip" ]]; then
+    echo "public IPv4 is $current (after $attempt attempt(s))"
+    break
+  fi
+
+  if (( attempt == 60 )); then
+    echo "FATAL: public IPv4 is still '$current' after five minutes; expected '$expected_ip'." >&2
+    echo "Refusing to start Caddy: it would request a certificate for an address that" >&2
+    echo "does not reach this host and spend Let's Encrypt rate limit on a failure." >&2
+    echo "Check the Elastic IP association, then re-run: /usr/local/bin/aws-chatbot-deploy" >&2
+    exit 1
+  fi
+
+  sleep 5
+done
+
+# ── start ─────────────────────────────────────────────────────────────────────
+# --build because what shipped is source: both images are built here.
+echo "--- building and starting the stack"
+cd "$app_dir/deploy"
+docker compose up --build -d
+
+# Each rebuild leaves the previous images dangling, and a 20 GiB root volume
+# fills after enough releases. Only untagged layers go — the build cache stays,
+# so the next build is still fast.
+docker image prune -f
+
+echo "=== deploy finished at $(date -Is) ==="
+docker compose ps
+DEPLOY
+
+chmod 0755 /usr/local/bin/aws-chatbot-deploy
+
+# ── run it ────────────────────────────────────────────────────────────────────
+/usr/local/bin/aws-chatbot-deploy
+
+echo "=== bootstrap finished at $(date -Is) ==="
