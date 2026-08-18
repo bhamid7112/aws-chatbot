@@ -2,7 +2,7 @@
 #
 #   docker compose up --build -d          start the stack
 #   docker compose run --rm api-tests     run the test suite inside the image
-#   docker compose logs -f api            follow the api log
+#   docker compose logs -f caddy          follow the edge log
 #   docker compose down                   stop and remove
 #
 # Compose auto-loads ./.env from this directory for the ${...} substitutions
@@ -10,11 +10,8 @@
 # explicitly under `environment:` rather than injected wholesale, so this file
 # stays an accurate description of what each service actually reads.
 #
-# Two services join later, and both slot in here without restructuring:
-#   web    — builds the React bundle (deploy/web.Dockerfile) into a shared volume
-#   caddy  — publishes 80/443, terminates TLS, serves the bundle, proxies /api/*
-# At that point `api` loses its `ports:` block, since Caddy becomes the only way
-# in and the API is reachable only on this network as `api:8000`.
+# Caddy is now the only way in: it publishes 80 and 443, serves the bundle, and
+# proxies /api/* to the API over this network. The API publishes nothing.
 
 name: aws-chatbot
 
@@ -29,13 +26,51 @@ services:
     environment:
       # `-` rather than `:-`: an explicitly empty value in .env must survive as
       # empty (that is how CORS is switched off) instead of falling back here.
+      # In the full stack it belongs empty, because Caddy makes the browser's
+      # origin and the API's origin the same one.
       CHAT_CORS_ALLOW_ORIGINS: ${CHAT_CORS_ALLOW_ORIGINS-http://localhost:5173,http://127.0.0.1:5173}
       CHAT_MAX_PROMPT_CHARS: ${CHAT_MAX_PROMPT_CHARS:-4000}
       CHAT_WORD_DELAY_SECONDS: ${CHAT_WORD_DELAY_SECONDS:-0.06}
-    ports:
-      # Temporary: direct access for testing. Removed once Caddy fronts the API.
-      - "${API_HOST_PORT:-8000}:8000"
+    # No `ports`. The API is reachable only as `api:8000` inside this network, so
+    # there is no route to it that bypasses the edge. To reach it directly while
+    # debugging, use `docker compose port` or add a published port in an override
+    # file rather than reopening one here.
+    #
     # The healthcheck is defined in the image, so it needs no repeating here.
+
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+      target: runtime
+    image: aws-chatbot-web:local
+    restart: unless-stopped
+    # Start order only, and deliberately not `condition: service_healthy`: Caddy
+    # serves the bundle whether or not the API is answering, and gating on API
+    # health would turn a backend fault into a blank page.
+    depends_on:
+      - api
+    environment:
+      # The default is the safe one. Unset or empty means a plain-HTTP local
+      # stack that never contacts an ACME server; setting this to an Elastic IP
+      # is what switches automatic HTTPS on. See deploy/caddy/Caddyfile.
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.invalid}
+    ports:
+      # 80 is not optional and not only for redirects: HTTP-01 is the only
+      # challenge that can validate an IP address, so this port carries every
+      # renewal for the life of the deployment.
+      - "80:80"
+      - "443:443"
+      # HTTP/3. Harmless when unused, and the local stack binds neither 443.
+      - "443:443/udp"
+    volumes:
+      # Certificates and the ACME account key live here. Without persistence
+      # every restart would re-issue from scratch, which with a six-day
+      # certificate and Let's Encrypt's rate limits is a way to lock yourself
+      # out of your own site.
+      - caddy_data:/data
+      - caddy_config:/config
 
   api-tests:
     # Behind a profile, so `docker compose up` never starts it. Reached with
@@ -46,3 +81,7 @@ services:
       dockerfile: deploy/api.Dockerfile
       target: test
     image: aws-chatbot-api-tests:local
+
+volumes:
+  caddy_data:
+  caddy_config:

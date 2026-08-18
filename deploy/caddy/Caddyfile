@@ -1,0 +1,92 @@
+# The edge: terminates TLS, serves the React bundle, and proxies the API — so the
+# browser talks to exactly one origin. That is why nothing in the frontend holds
+# an API base URL: /api/chat is a relative path here and in dev alike.
+#
+# SITE_ADDRESS is the entire configuration surface, and it takes exactly two
+# shapes:
+#
+#   http://localhost   an explicit scheme turns Caddy's automatic HTTPS off
+#                      completely, so a local stack cannot reach an ACME server
+#                      even by accident. This is the default in compose.
+#   an IP literal      e.g. 203.0.113.10 — automatic HTTPS, certificate issued
+#                      by Let's Encrypt over HTTP-01. Production, and a
+#                      deliberate act.
+#
+# A bare port such as `:80` is *not* a third option: with no scheme Caddy still
+# attaches the default_sni connection policy below, then refuses to start a TLS
+# policy on a plain-HTTP listener. Both shapes above are checked at image build
+# time (deploy/web.Dockerfile), so neither can regress unnoticed.
+#
+# Neither SITE_ADDRESS nor ACME_EMAIL carries a default here: docker-compose.yml
+# is the single place their values are decided.
+{
+	# Optional for issuance, and the only channel a CA has to reach the account
+	# holder. Unused locally, where no ACME account is ever created.
+	email {$ACME_EMAIL}
+
+	# A browser connecting to an IP literal sends no SNI at all, because SNI
+	# carries host *names* and an address is not a name. With no default there is
+	# nothing to select a certificate by, so the handshake fails before any
+	# request is made and every visitor sees a TLS error rather than a slow site.
+	# This one line is the difference between working and not.
+	default_sni {$SITE_ADDRESS}
+}
+
+{$SITE_ADDRESS} {
+	tls {
+		issuer acme {
+			# Certificates for IP addresses are only issued under Let's Encrypt's
+			# short-lived profile — roughly a six-day lifetime, renewed at about
+			# two thirds of it. Port 80 therefore has to stay reachable for good
+			# and not merely once: a port 80 closed after issuance looks fine
+			# until the first renewal fails days later and the site goes dark.
+			profile shortlived
+			# TLS-ALPN cannot validate an IP identifier, and Caddy tries it first
+			# by default and fails (caddyserver/caddy#7399). Disabling it forces
+			# HTTP-01, which is the reason port 80 matters above.
+			disable_tlsalpn_challenge
+		}
+	}
+
+	# Everything the API owns already lives under /api, so one matcher covers
+	# /api/chat, /api/health and /api/docs, and the path passes through unchanged.
+	handle /api/* {
+		reverse_proxy api:8000 {
+			# A negative interval disables response buffering and flushes after
+			# every write.
+			#
+			# Measured, not assumed: Caddy already flushes immediately for
+			# text/event-stream, and removing this line changes nothing about how
+			# the reply arrives today. It stays as insurance, because it makes the
+			# guarantee independent of content-type detection — the word-by-word
+			# stream is the only behaviour this application has, and it should not
+			# rest on a response header staying exactly as it is.
+			flush_interval -1
+		}
+	}
+
+	handle {
+		root * /srv/www
+		# Compression belongs here rather than at the site level: the bundle is
+		# what benefits, while an event stream must not be held back to fill a
+		# compression window.
+		encode zstd gzip
+		# Client-side routing: an unknown path is a route for the app to resolve,
+		# not a file that is missing.
+		#
+		# /assets/* is excluded deliberately. It holds content-hashed build
+		# output, where a miss is a genuine 404 — answering with the HTML shell
+		# makes the browser execute index.html as JavaScript and fail with a
+		# syntax error that points nowhere near the cause. That is precisely what
+		# a redeploy does to a tab still asking for a chunk from the last one.
+		@spa {
+			not path /assets/*
+			not file
+		}
+		rewrite @spa /index.html
+
+		file_server
+	}
+
+	log
+}
