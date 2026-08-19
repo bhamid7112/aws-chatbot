@@ -53,6 +53,9 @@ terraform.rc
 .env
 .env.*
 !.env.example
+# Mounts the developer's own AWS profile into the api container. Must stay
+# untracked: on the instance it would shadow the EC2 instance role.
+deploy/docker-compose.override.yml
 *.pem
 *.key
 *.p12
