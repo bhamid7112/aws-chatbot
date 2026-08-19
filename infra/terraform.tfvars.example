@@ -58,3 +58,17 @@ acme_email = "you@example.com"
 # they collide with something you intend to peer with.
 # vpc_cidr           = "10.0.0.0/16"
 # public_subnet_cidr = "10.0.1.0/24"
+
+# ── the model ────────────────────────────────────────────────────────────────
+# Both default to what the application defaults to, so neither line is required.
+# They exist here because the model ID also scopes the instance role's invoke
+# permission (see iam.tf) — setting one without the other is how you get an
+# AccessDeniedException that looks like a model problem.
+#
+# bedrock_region is separate from aws_region on purpose: model availability is
+# patchier than the rest of AWS, so the host can sit in one region while inference
+# happens in another that actually offers the model. google.gemma-3-27b-it has no
+# cross-region inference profile, so there is no us.-prefixed variant to fall back
+# on and this must name a region that serves it.
+# bedrock_model_id = "google.gemma-3-27b-it"
+# bedrock_region   = "us-east-1"

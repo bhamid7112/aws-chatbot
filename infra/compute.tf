@@ -39,6 +39,8 @@ resource "aws_instance" "app" {
     site_address       = aws_eip.web.public_ip
     swap_size_gb       = var.swap_size_gb
     docker_compose_url = local.docker_compose_url
+    bedrock_model_id   = var.bedrock_model_id
+    bedrock_region     = var.bedrock_region
 
     # Passed through rather than resolved into a URL here: the buildx asset's
     # filename embeds its version, so an empty value has to be resolved on the
@@ -62,11 +64,28 @@ resource "aws_instance" "app" {
     # IMDSv2 only. Session-oriented, so the SSRF-style request that trivially
     # reads credentials from IMDSv1 does not work.
     http_tokens = "required"
-    # Deliberately 1, the default. user_data queries IMDS from the host, which
-    # this allows, while one hop is not enough to reach it from inside a
-    # container on the bridge network — so neither the API nor Caddy can read the
-    # instance role's credentials, and neither has any reason to.
-    http_put_response_hop_limit = 1
+    # 2, raised from the default of 1, and this reverses an earlier decision worth
+    # recording rather than quietly overwriting.
+    #
+    # It used to be 1 precisely so that containers could NOT read the instance
+    # role: one hop reaches IMDS from the host (which user_data needs, below) but
+    # not from inside a container on the bridge network. That held while the API
+    # called nothing in AWS. It now calls Bedrock, so the api container has to
+    # reach IMDS, and 2 is the documented hop count for exactly that.
+    #
+    # What the change costs: any process in any container on this host can now
+    # assume the instance role. Two things bound it. IMDSv2 is still mandatory
+    # above, so the one-shot SSRF-style GET that lifts credentials from IMDSv1
+    # does not work — an attacker needs to be able to make a PUT and read the
+    # response, i.e. already be running code here. And the role can do nothing but
+    # invoke a single Bedrock model (see iam.tf), so the worst case is somebody
+    # spending money on inference, not reading data.
+    #
+    # The alternative — leaving this at 1 and putting a long-lived API key in the
+    # container — trades a bounded, auto-rotating, CloudTrail-attributed credential
+    # for a static secret in a file on a public-facing host. That is the worse
+    # trade, so: 2.
+    http_put_response_hop_limit = 2
   }
 
   root_block_device {

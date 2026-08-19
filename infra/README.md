@@ -11,7 +11,7 @@ public IP, with no domain name involved.
 | `locals.tf` | Name prefix, tags, repo root, Compose download URL |
 | `network.tf` | Dedicated VPC, public subnet, IGW, route table, AZ selection |
 | `security.tf` | Security group and its rules. No port 22 anywhere |
-| `iam.tf` | Instance role: SSM managed node access, and nothing else |
+| `iam.tf` | Instance role: SSM managed node access, plus invoke on one Bedrock model |
 | `compute.tf` | Elastic IP, AL2023 instance, EIP association |
 | `outputs.tf` | The URL, and the commands used after apply |
 | `templates/user_data.sh.tftpl` | First-boot bootstrap and the deploy command it installs |
@@ -25,8 +25,9 @@ Three decisions explain most of the file:
 - **The instance clones the repository and builds the images itself.** No
   registry, no image-push step, no artifact bucket and no second build environment
   to keep in step with the Dockerfiles — and because the repository is public,
-  no credential on the host either. The instance role can do exactly one thing: be
-  an SSM managed node. The Vite build on a t3.micro is what the swapfile is for.
+  no credential on the host either. The instance role can do exactly two things:
+  be an SSM managed node, and invoke one Bedrock model. The Vite build on a
+  t3.micro is what the swapfile is for.
 - **Terraform has no part in a release.** `user_data` names a repository and a
   ref, not a revision, so shipping code is `git push` followed by re-running the
   deploy script over SSM. Infrastructure changes can never half-restart a running
@@ -47,8 +48,11 @@ Three decisions explain most of the file:
   provider finds no usable credentials, falls through the chain to instance
   metadata, and fails with `No valid credential sources found` plus a timeout
   against `169.254.169.254` — which reads like a network fault and is not one.
-- Permissions to create VPC, EC2, EIP, IAM role/policy/instance-profile, S3 and
-  SSM resources.
+- Permissions to create VPC, EC2, EIP and IAM role/policy/instance-profile
+  resources, and to read the public AL2023 AMI parameter from SSM.
+- Bedrock access to `google.gemma-3-27b-it` in `bedrock_region`. Check with
+  `aws bedrock get-foundation-model-availability --model-id google.gemma-3-27b-it
+  --region us-east-1` — `authorizationStatus` must be `AUTHORIZED`.
 - A real email address for Let's Encrypt.
 
 - The application code **committed and pushed** to the ref named by `git_ref`
@@ -146,7 +150,7 @@ There is no SSH, no port 22 and no key pair. Sessions land as `ssm-user`; use
 terraform destroy
 ```
 
-Removes everything including the VPC and the bucket. Worth doing when the
+Removes everything, including the VPC. Worth doing when the
 deployment is idle: an Elastic IP is free while attached to a running instance and
 billed hourly once it is merely allocated, so a stopped-but-not-destroyed
 deployment is the one way this costs money while doing nothing.
@@ -160,6 +164,9 @@ deployment is the one way this costs money while doing nothing.
 | TLS handshake fails with no useful error | Almost always `default_sni` in the Caddyfile: a browser sends no SNI for an IP literal, so without it Caddy cannot pick a certificate. Check the Caddyfile in the artifact is the committed one. |
 | Certificate never issues | `sudo docker compose logs caddy` in `/opt/aws-chatbot/deploy`. Check port 80 reachability from outside first. |
 | Site works, then dies about a week later | A renewal failed. Port 80 closed after issuance is the usual cause. |
+| Every chat replies "The assistant could not complete the reply." | The API reached the code path but Bedrock refused. `sudo docker compose logs api` in `/opt/aws-chatbot/deploy` has the real cause — the generic message is deliberate, so vendor detail never reaches the browser. Usual suspects: the model not enabled in `bedrock_region`, or `CHAT_BEDROCK_MODEL_ID` and the IAM policy's ARN disagreeing. |
+| `NoCredentialsError` or an IMDS timeout in the api log | The container cannot reach instance metadata. `http_put_response_hop_limit` must be **2**: one hop reaches IMDS from the host but not from inside a container on the bridge network. Confirm with `docker compose exec api python -c "import botocore.session as s; print(s.get_session().get_credentials().method)"` — it must print `iam-role`. |
+| `AccessDeniedException` on `InvokeModel` | The role's policy names one model ARN. If `bedrock_model_id` or `bedrock_region` changed, `terraform apply` to re-scope it; IAM is eventually consistent, so allow a few seconds after the apply. |
 | Reply arrives all at once instead of word by word | Buffering between browser and API. `flush_interval -1` is already set on the reverse proxy; check nothing else (a corporate proxy, a CDN) sits in front. |
 | `compose build requires buildx 0.17.0 or later` | The buildx plugin is missing or too old. `user_data` installs it; if it could not reach `api.github.com` to resolve the latest tag, pin `docker_buildx_version` (e.g. `v0.36.1`). |
 | Deploy log ends at a git error | `fatal: could not read Username` means the repository is no longer public. `couldn't find remote ref` means `git_ref` names something that was never pushed. |
@@ -168,13 +175,35 @@ deployment is the one way this costs money while doing nothing.
 | `Invalid force-replace address` / `Invalid target` from PowerShell | PowerShell mangles unquoted `-flag=value` arguments (`-replace` and `-target` are also its own operators). Quote them: `terraform apply "-replace=aws_instance.app"`. |
 | Plan wants to replace the instance | Read it carefully before agreeing — a replacement loses the certificate and the image cache. An `ami` change should never appear (it is ignored); a `user_data` change means a stop/start, not a replacement. |
 
+## Credentials on the instance
+
+There are none stored, and that is the design. The api container reads
+short-lived credentials from IMDS using the instance role; there is no API key, no
+IAM user and no secret in any file on the host. `deploy/.env` holds only the site
+address, the ACME email and the model and region — every line non-secret, which
+matters because that file is rendered from `user_data`, and `user_data` is itself
+readable from the host.
+
+`iam.tf` scopes the role to `bedrock:InvokeModel` and
+`bedrock:InvokeModelWithResponseStream` on a single foundation-model ARN. That
+narrowness is load-bearing: `compute.tf` had to raise
+`http_put_response_hop_limit` to 2 so a container could reach IMDS at all, which
+means any process in any container here can now assume the role. IMDSv2 is still
+required, so lifting credentials needs code already running on the box rather than
+a single forged request — and what the role permits is inference on one model, so
+the worst case is a bill rather than a breach. Both files carry the same reasoning
+inline.
+
+Anything genuinely secret, should this ever need one, belongs in SSM Parameter
+Store fetched by the deploy script on the host — not in `user_data`.
+
 ## Known limits
 
 - **Local state.** `terraform.tfstate` in this directory is the only record of
   what exists. It is gitignored; back it up before anything destructive. Moving to
   an S3 backend is a `backend "s3"` block plus `terraform init -migrate-state`.
 - **The repository must stay public.** Cloning uses no credentials, which is what
-  removes the artifact bucket, the S3 grant and any secret on the host. Make the
+  removes the artifact bucket, the S3 grant and any stored secret on the host. Make the
   repository private and the next redeploy fails on authentication — recoverable,
   but the fix is a deploy token read from SSM Parameter Store, not a line in
   `user_data` where it would sit in plaintext in the instance's metadata.

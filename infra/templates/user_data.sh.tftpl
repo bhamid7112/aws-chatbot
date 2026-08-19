@@ -148,13 +148,24 @@ echo "--- deploying $(git -C "$app_dir" log -1 --format='%h %s')"
 # the browser's origin and the API's origin the same one, so there is no
 # cross-origin request to permit — and compose's `$${VAR-default}` treats an
 # explicitly empty value as set, which is how CORS is switched off.
+#
+# Every line below is non-secret, which is not an accident. Bedrock credentials
+# are never written here: the api container reads the instance role from IMDS, and
+# there is deliberately no API key, no IAM user and no secret anywhere on this
+# host. Anything genuinely secret would need SSM Parameter Store rather than a
+# file rendered from user_data, which is itself readable from the host.
 umask 077
 cat > "$app_dir/deploy/.env" <<'ENV'
 SITE_ADDRESS=${site_address}
 ACME_EMAIL=${acme_email}
 CHAT_CORS_ALLOW_ORIGINS=
+CHAT_BEDROCK_MODEL_ID=${bedrock_model_id}
+CHAT_BEDROCK_REGION=${bedrock_region}
 ENV
 umask 022
+
+# CHAT_REPLY_SOURCE is absent on purpose: `bedrock` is the application default, so
+# writing it would only create a second place for the two to disagree.
 
 # ── wait for the Elastic IP ───────────────────────────────────────────────────
 # The instance boots with an auto-assigned public address and Terraform

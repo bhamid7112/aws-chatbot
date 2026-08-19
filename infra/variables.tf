@@ -201,3 +201,26 @@ variable "docker_buildx_version" {
     error_message = "docker_buildx_version must be empty or a release tag like v0.36.1."
   }
 }
+
+variable "bedrock_model_id" {
+  description = <<-EOT
+    The Bedrock foundation model the API calls. Also scopes the instance role's
+    invoke permission, so the role can reach exactly this model and no other.
+
+    Note that `google.gemma-3-27b-it` has no cross-region inference profile: there
+    is no `us.`-prefixed variant, so `bedrock_region` must be a region that
+    actually offers the model rather than merely a nearby one.
+  EOT
+  type        = string
+  default     = "google.gemma-3-27b-it"
+}
+
+variable "bedrock_region" {
+  description = <<-EOT
+    Region whose Bedrock endpoint the API calls. Independent of `aws_region` on
+    purpose: model availability is patchier than the rest of AWS, so the host can
+    live in one region while inference happens in another that offers the model.
+  EOT
+  type        = string
+  default     = "us-east-1"
+}
