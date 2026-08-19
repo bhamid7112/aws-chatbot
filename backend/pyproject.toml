@@ -4,6 +4,10 @@ version = "0.1.0"
 description = "Streaming chat API — Clean Architecture, FastAPI, Server-Sent Events."
 requires-python = ">=3.12"
 dependencies = [
+    # The floor is not cosmetic: google.gemma-3-27b-it is a recent addition, and an
+    # older botocore ships a service model that rejects the model ID before the
+    # request is ever signed.
+    "boto3>=1.40,<2.0",
     "fastapi>=0.115,<1.0",
     "pydantic>=2.9,<3.0",
     "uvicorn[standard]>=0.30,<1.0",
@@ -23,6 +27,10 @@ dev = [
 lint = [
     "mypy>=1.11",
     "ruff>=0.6",
+    # boto3 ships no inline types, and `strict = true` would otherwise force
+    # `type: ignore` at every call site. A lint-group dependency rather than a
+    # runtime one: the stubs are for mypy and have no business in the image.
+    "boto3-stubs[bedrock-runtime]>=1.40",
 ]
 
 [tool.uv]

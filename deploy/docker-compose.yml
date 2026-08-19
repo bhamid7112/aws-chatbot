@@ -10,6 +10,11 @@
 # explicitly under `environment:` rather than injected wholesale, so this file
 # stays an accurate description of what each service actually reads.
 #
+# Note what is absent: anything credential-shaped. On EC2 the api container reads
+# the instance role from IMDS and needs no configuration at all. Locally, an SSO
+# profile is mounted in by docker-compose.override.yml, which exists only on a
+# developer's machine — see docker-compose.override.yml.example.
+#
 # Caddy is now the only way in: it publishes 80 and 443, serves the bundle, and
 # proxies /api/* to the API over this network. The API publishes nothing.
 
@@ -30,7 +35,18 @@ services:
       # origin and the API's origin the same one.
       CHAT_CORS_ALLOW_ORIGINS: ${CHAT_CORS_ALLOW_ORIGINS-http://localhost:5173,http://127.0.0.1:5173}
       CHAT_MAX_PROMPT_CHARS: ${CHAT_MAX_PROMPT_CHARS:-4000}
+      # Only consulted by the canned generator; harmless otherwise.
       CHAT_WORD_DELAY_SECONDS: ${CHAT_WORD_DELAY_SECONDS:-0.06}
+      # `bedrock` calls the real model and needs credentials; `canned` needs none
+      # and is how the stack runs with no AWS account at all.
+      CHAT_REPLY_SOURCE: ${CHAT_REPLY_SOURCE:-bedrock}
+      CHAT_BEDROCK_MODEL_ID: ${CHAT_BEDROCK_MODEL_ID:-google.gemma-3-27b-it}
+      # This model has no cross-region inference profile, so the region is a real
+      # constraint rather than a preference.
+      CHAT_BEDROCK_REGION: ${CHAT_BEDROCK_REGION:-us-east-1}
+      CHAT_BEDROCK_MAX_OUTPUT_TOKENS: ${CHAT_BEDROCK_MAX_OUTPUT_TOKENS:-1024}
+      CHAT_BEDROCK_TEMPERATURE: ${CHAT_BEDROCK_TEMPERATURE:-0.7}
+      CHAT_MAX_HISTORY_MESSAGES: ${CHAT_MAX_HISTORY_MESSAGES:-20}
     # No `ports`. The API is reachable only as `api:8000` inside this network, so
     # there is no route to it that bypasses the edge. To reach it directly while
     # debugging, use `docker compose port` or add a published port in an override

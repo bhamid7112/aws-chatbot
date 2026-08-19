@@ -1,0 +1,36 @@
+# Local development only. Copy to docker-compose.override.yml — Compose loads that
+# name automatically, so `docker compose up` picks it up with no extra flags.
+#
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   aws sso login --profile <AWS_PROFILE>
+#
+# WHY THIS FILE IS NOT THE OVERRIDE ITSELF
+# The instance deploys by `git fetch` + `reset --hard`, so a committed
+# docker-compose.override.yml would land on the server and be auto-loaded there
+# too. It would set AWS_PROFILE against a ~/.aws that does not exist on the host,
+# and boto3 would fail on the missing profile instead of falling through to the
+# instance role. Keeping the real override untracked is what makes "production
+# needs no credential configuration" true rather than merely intended.
+#
+# In production nothing here applies: the api container reads the EC2 instance
+# role from IMDS, and no key or profile exists anywhere on the box.
+
+services:
+  api:
+    environment:
+      # Your SSO profile. `aws configure list-profiles` if you are unsure.
+      AWS_PROFILE:
+      # The runtime image creates its user with --no-create-home and never sets
+      # HOME. /home/app is the passwd entry, so expanduser("~") lands there
+      # anyway, but botocore's SSO cache lookup depends on it — say it outright.
+      HOME: /home/app
+    volumes:
+      # Read-only, and mounted at the container user's home rather than somewhere
+      # tidier: the SSO token cache lives at ~/.aws/sso/cache and botocore finds
+      # it from the home directory, NOT from AWS_CONFIG_FILE. Mount it elsewhere
+      # and the profile resolves while the token does not.
+      #
+      # :ro means the container cannot refresh an expired token — that is
+      # deliberate. Refreshing is `aws sso login` on the host, and the container
+      # sees the new token on its next call without a restart.
+      - ~/.aws:/home/app/.aws:ro
