@@ -50,12 +50,16 @@ there is no route to it that bypasses the edge.
 | Containers | Docker + Compose, multi-stage builds | Two images: `api` (Python) and `web` (Caddy with the compiled bundle baked in). |
 | Edge | Caddy 2.11 | Automatic HTTPS with ACME built in — and, critically, it can obtain a certificate for an IP address. |
 | Host | One EC2 `t3.micro`, Amazon Linux 2023, Elastic IP | Free-tier eligible. A load balancer cannot present a certificate for an address it does not own, so the certificate lives where the address lives. |
-| Infrastructure | Terraform (AWS provider), local state | 16 resources: dedicated VPC, public subnet, IGW, security group, IAM instance role, EIP, instance. |
+| Model | Google **Gemma 3 27B IT** on Amazon Bedrock, via the streaming Converse API | An open-weight instruction-tuned model with a 128K context, served on-demand with no endpoint to keep warm. Bedrock means one API and no vendor SDK of its own. |
+| Infrastructure | Terraform (AWS provider), local state | 17 resources: dedicated VPC, public subnet, IGW, security group, IAM instance role, scoped Bedrock invoke policy, EIP, instance. |
 | Access | SSM Session Manager | No SSH, no port 22, no key pair anywhere in the configuration. |
 
-The chatbot's reply is currently **canned** — a fixed sentence streamed word by
-word to simulate a model typing. That is deliberate, and the architecture is
-built around making it replaceable: see [the swap point](#swapping-in-a-real-model).
+Replies come from **Gemma 3 27B on Amazon Bedrock**, streamed token by token to
+the browser. The original canned generator is still there and still supported —
+`CHAT_REPLY_SOURCE=canned` runs the whole stack with no AWS account, no
+credentials and no network, which is how it demos offline. Neither the domain nor
+the use case knows which of the two it is talking to: see
+[the reply source](#the-reply-source).
 
 ## How the app works
 
@@ -126,7 +130,7 @@ gate**, not a convention:
 | --- | --- | --- |
 | **domain** | `entities.py`, `ports.py`, `errors.py` — pure Python, no framework | `message.ts`, `chatGateway.ts`, `errors.ts` — no imports at all |
 | **application** | `chat_service.py` — the use case; no FastAPI, no Pydantic, no SSE | `useChat.ts` — the use case as a hook; React is the one allowed import |
-| **infrastructure** | `canned_reply_generator.py`, `config.py` | `sseChatGateway.ts` — the only file that knows the reply arrives over HTTP |
+| **infrastructure** | `bedrock_reply_generator.py`, `canned_reply_generator.py`, `config.py` | `sseChatGateway.ts` — the only file that knows the reply arrives over HTTP |
 | **interfaces / presentation** | `routes.py`, `schemas.py`, `sse.py`, `dependencies.py` | `ChatWindow`, `ChatInput`, `MessageBubble`, … |
 | **main** | `main.py` — assembles, then gets out of the way | `main.tsx` — the only file naming a concrete gateway |
 
@@ -140,31 +144,81 @@ The inner layers depend on **ports** (a `Protocol` in Python, an `interface` in
 TypeScript), never on implementations, and the concrete choice is made in one
 place per side: `dependencies.py` and `main.tsx`.
 
-### Swapping in a real model
+### The reply source
 
-`ChatService` asks for a `ReplyGenerator`. Today
-[dependencies.py](backend/app/interfaces/dependencies.py) answers
-`CannedReplyGenerator`. Putting a real model behind the same UI is:
+`ChatService` asks for a `ReplyGenerator`; only
+[dependencies.py](backend/app/interfaces/dependencies.py) knows what it gets.
+There are two implementations of that one-method port, and swapping between them
+is a config value rather than a code change:
 
-1. add `backend/app/infrastructure/bedrock_reply_generator.py` implementing the
-   same `generate(request) -> AsyncIterator[ReplyChunk]` contract, translating
-   any vendor failure into `ReplyGenerationError`;
-2. change one line in `get_reply_generator`.
+| `CHAT_REPLY_SOURCE` | Implementation | Needs |
+| --- | --- | --- |
+| `bedrock` *(default)* | [bedrock_reply_generator.py](backend/app/infrastructure/bedrock_reply_generator.py) — Gemma 3 27B over Converse streaming | AWS credentials |
+| `canned` | [canned_reply_generator.py](backend/app/infrastructure/canned_reply_generator.py) — one fixed sentence, word by word | nothing at all |
 
-No edit to `domain`, `application`, `routes`, the SSE framing, or any file in
-the front end. The history is already carried on the request and already
-translated into domain entities, waiting for a consumer.
+Adding the model touched no file in `domain`, `application`, `routes`, the SSE
+framing, or the entire front end. The wire format did not change, because the
+reply was always streamed; the model simply became the thing producing the
+fragments. Conversation history had been carried on the request and translated
+into domain entities since the first commit, waiting for a consumer — the
+Bedrock adapter is the first thing to read it.
+
+Three things the adapter does that are worth knowing:
+
+- **It runs boto3 off the event loop.** botocore's event stream is synchronous:
+  `for event in response["stream"]` waits on a socket. Iterating that directly
+  inside an `async` generator would stall the whole loop between tokens, so a
+  second chat could not begin until the first finished. Each step goes through
+  `anyio.to_thread` instead.
+- **It repairs history rather than trusting it.** History arrives from the
+  browser, and Converse rejects turns that do not alternate starting from the
+  user. Rather than let a malformed history become a `ValidationException` — a
+  chat that appears to be broken — the adapter drops the offending turns and
+  sends slightly less context.
+- **It sets `maxTokens` explicitly.** Left unset, Bedrock reserves the model's
+  own maximum against the account's per-minute token quota on every call, and
+  throttling arrives long before traffic would explain it.
+
+### Credentials
+
+The application contains no credential handling at all, and
+[config.py](backend/app/infrastructure/config.py) reads no AWS variable. boto3's
+default chain resolves them, so the same image runs in both places unmodified:
+
+| Where | How | Rotation |
+| --- | --- | --- |
+| Local | An SSO profile mounted read-only into the api container by `docker-compose.override.yml` | `aws sso login` on the host |
+| EC2 | The instance role, read from IMDS | Automatic; nothing stored |
+
+There is **no API key anywhere**, by choice. A short-term Bedrock API key expires
+with the console session (12 hours at most), and a long-term one is a static
+IAM-user credential in a file on a public-facing host — in a deployment that
+otherwise has no SSH key, no key pair and no stored secret of any kind. The
+instance role gives short-lived credentials, scoped in
+[infra/iam.tf](infra/iam.tf) to `InvokeModel` on one model ARN and nothing else,
+with every call attributable in CloudTrail.
+
+Nothing secret is ever written to `deploy/.env`. On the instance that file is
+regenerated from a heredoc on every release, so hand edits there do not survive
+the next deploy.
 
 ### Configuration
 
-The API reads exactly three environment variables, all optional
-(see [config.py](backend/app/infrastructure/config.py)):
+Every variable is optional (see
+[config.py](backend/app/infrastructure/config.py)):
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `CHAT_CORS_ALLOW_ORIGINS` | the two Vite dev origins | Explicitly **empty** in production; empty means no CORS middleware at all |
 | `CHAT_MAX_PROMPT_CHARS` | `4000` | Over-long prompts are rejected with `422` before streaming |
-| `CHAT_WORD_DELAY_SECONDS` | `0.06` | Pace of the simulated typing |
+| `CHAT_REPLY_SOURCE` | `bedrock` | `canned` for a stack that needs no AWS |
+| `CHAT_BEDROCK_MODEL_ID` | `google.gemma-3-27b-it` | Also scopes the IAM policy, via a Terraform variable |
+| `CHAT_BEDROCK_REGION` | `us-east-1` | This model has **no** cross-region inference profile, so the region must be one that offers it |
+| `CHAT_BEDROCK_MAX_OUTPUT_TOKENS` | `1024` | Model ceiling is 8192 |
+| `CHAT_BEDROCK_TEMPERATURE` | `0.7` | |
+| `CHAT_MAX_HISTORY_MESSAGES` | `20` | Turns resent for context. Every turn sent is re-billed as input, so this is a cost dial as much as a memory one |
+| `CHAT_SYSTEM_PROMPT` | a short persona | Explicitly empty sends no system prompt at all |
+| `CHAT_WORD_DELAY_SECONDS` | `0.06` | Canned generator only; Bedrock's pacing comes from the model |
 
 ## Repository layout
 
@@ -188,6 +242,30 @@ docker compose up --build -d
 `docker-compose.yml` carries local defaults for every value, so no `.env` is
 required. Copy `.env.example` to `.env` only when you want to override one —
 Compose auto-loads it from that directory, no `--env-file` flag needed.
+
+Replies come from Bedrock by default, so the api container needs credentials.
+Mount your own SSO profile into it:
+
+```powershell
+cd deploy
+cp docker-compose.override.yml.example docker-compose.override.yml
+# edit AWS_PROFILE in it to match `aws configure list-profiles`
+aws sso login --profile <your-profile>
+docker compose up --build -d
+```
+
+Compose loads `docker-compose.override.yml` automatically. It stays **untracked**
+on purpose: the instance deploys by `git reset --hard`, so a committed override
+would land there too and shadow the EC2 instance role with a profile that does
+not exist on the host. Confirm it worked with:
+
+```powershell
+docker compose exec api python -c "import botocore.session as s; print(s.get_session().get_credentials().method)"
+```
+
+`sso` locally, `iam-role` on the instance. To skip all of this and run with no
+AWS account at all, set `CHAT_REPLY_SOURCE=canned` in `.env` — the stack then
+needs no credentials, no override file and no network.
 
 Open <http://localhost>. `SITE_ADDRESS` defaults to `http://localhost`, and an
 explicit scheme turns Caddy's automatic HTTPS **off completely** — a local stack
