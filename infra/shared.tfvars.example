@@ -1,0 +1,34 @@
+# Settings both deployment targets share.
+#
+# Copy to shared.tfvars (gitignored) and pass it to either stack:
+#
+#   terraform -chdir=infra/server     apply -var-file=../shared.tfvars
+#   terraform -chdir=infra/serverless apply -var-file=../shared.tfvars
+#
+# It sits here rather than being imported by each stack because Terraform has no
+# mechanism for sharing a tfvars file across root modules — the invocation is the
+# only place the two can be brought together. Each stack additionally has its own
+# terraform.tfvars for the settings only it has.
+#
+# Note that `aws_region` means different things to the two stacks: for server it
+# is where the Elastic IP and therefore the certificate's identity lives, and for
+# serverless it is where ECR, the function and its log group live. If the two
+# targets should sit in different regions, set aws_region in each stack's own
+# terraform.tfvars instead of here.
+
+# Which account this builds in. Pinning it here makes the answer reviewable
+# rather than dependent on whatever AWS_PROFILE the shell happened to export;
+# creating a deployment in the wrong account is not an error Terraform can catch.
+aws_profile = "your-sso-profile"
+
+aws_region = "us-east-2"
+
+# Name prefix and Project tag for both stacks. Safe to share: the two stacks
+# create disjoint resource types, so nothing collides in one account.
+project = "aws-chatbot"
+
+# This model has no cross-region inference profile — there is no `us.`-prefixed
+# variant — so bedrock_region must be a region that actually offers it rather
+# than merely a nearby one.
+bedrock_model_id = "google.gemma-3-27b-it"
+bedrock_region   = "us-east-2"
