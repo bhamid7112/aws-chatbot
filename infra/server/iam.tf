@@ -49,33 +49,19 @@ resource "aws_iam_instance_profile" "instance" {
 
 # The one thing the application itself is allowed to do.
 #
-# Scoped to a single model ARN rather than "bedrock:InvokeModel on *", and that
-# narrowness is doing real work: the metadata hop limit had to be raised to 2 for
-# a container to reach IMDS at all (see compute.tf), so this policy is what bounds
-# what a compromised container could actually do with the role. Running inference
-# on one model is a bill; listing buckets or reading secrets would be a breach.
-#
-# Both actions are needed. The API streams, so it calls InvokeModelWithResponseStream
-# via Converse's streaming variant; InvokeModel covers the non-streaming path and
-# any future use that does not stream.
-#
-# No region in the ARN, and no account: foundation-model ARNs are
-# arn:aws:bedrock:<region>::foundation-model/<id> — note the empty account field —
-# and pinning the region here would silently break the day bedrock_region changes.
-data "aws_iam_policy_document" "bedrock_invoke" {
-  statement {
-    sid    = "InvokeOneFoundationModel"
-    effect = "Allow"
+# The policy document lives in ../modules/bedrock_access because the serverless
+# stack's Lambda execution role needs the identical grant, and the reasoning for
+# its shape — one model, both invoke actions, the empty account field in a
+# foundation-model ARN — is worth stating once. That module is also where the
+# argument for scoping this narrowly now lives; the short version is that the
+# metadata hop limit had to be raised to 2 for a container to reach IMDS at all
+# (see compute.tf), so this policy is what bounds what a compromised container
+# could do with the role.
+module "bedrock_access" {
+  source = "../modules/bedrock_access"
 
-    actions = [
-      "bedrock:InvokeModel",
-      "bedrock:InvokeModelWithResponseStream",
-    ]
-
-    resources = [
-      "arn:aws:bedrock:${var.bedrock_region}::foundation-model/${var.bedrock_model_id}",
-    ]
-  }
+  bedrock_model_id = var.bedrock_model_id
+  bedrock_region   = var.bedrock_region
 }
 
 # Inline rather than a managed policy: it exists only for this role, has no reuse
@@ -84,5 +70,5 @@ data "aws_iam_policy_document" "bedrock_invoke" {
 resource "aws_iam_role_policy" "bedrock_invoke" {
   name   = "bedrock-invoke"
   role   = aws_iam_role.instance.id
-  policy = data.aws_iam_policy_document.bedrock_invoke.json
+  policy = module.bedrock_access.policy_json
 }
