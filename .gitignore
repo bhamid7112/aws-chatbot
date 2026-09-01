@@ -42,6 +42,12 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 .terraformrc
+
+# ── Release artifacts ────────────────────────────────────────────
+# Where `docker buildx --output type=local` drops the frontend bundle on its way
+# to S3. Covered incidentally by `dist/` above; named here so it stays covered if
+# the release scripts ever write anything else under it.
+.build/
 terraform.rc
 
 # Variable files carry account IDs, emails and IPs — commit only the example
