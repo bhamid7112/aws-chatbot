@@ -1,0 +1,57 @@
+# Settings that belong to the serverless target only. Copy to terraform.tfvars
+# (gitignored) and edit. Everything here has a working default, so an empty file
+# is valid — the values below are the ones worth knowing about.
+#
+# Shared settings (aws_region, aws_profile, project, bedrock_model_id,
+# bedrock_region) live in ../shared.tfvars and are passed on the command line:
+#
+#   terraform -chdir=infra/serverless apply -var-file=../shared.tfvars
+
+# ── Phase 0: verifying the deployment before trusting it ──────────────────────
+#
+# `canned` streams a fixed reply at a known, fixed cadence with no AWS call at
+# all. That makes it the sharper instrument for checking that the response
+# streams end to end: a real model's cadence is unknown, so a burst arriving all
+# at once proves nothing, whereas with `canned` it proves something is buffering.
+#
+# Flip to "bedrock" once streaming is confirmed.
+# reply_source       = "canned"
+# word_delay_seconds = 0.06
+
+# ── Packaging ─────────────────────────────────────────────────────────────────
+
+# Must match what scripts/release-api.sh builds — one variable drives both,
+# because a mismatch fails at function-create time with an architecture error.
+#
+# x86_64 is the default because an arm64 image builds under QEMU on an x86
+# workstation and `uv sync` under emulation is slow. arm64 is cheaper per
+# millisecond; switch once the deployment is stable or releases move to CI.
+# lambda_architecture = "x86_64"
+
+# Read only when the function is first created. Afterwards releases update the
+# function by digest and Terraform ignores image_uri, so editing this does
+# nothing to an existing deployment.
+# image_tag = "bootstrap"
+
+# ── Sizing ────────────────────────────────────────────────────────────────────
+
+# Memory also buys proportional CPU, and this function's cold start is CPU-bound
+# (importing FastAPI and boto3), so a larger size can finish init sooner and cost
+# less overall. Measure Init Duration in the REPORT log lines before changing it.
+# memory_size_mb = 1536
+
+# Must exceed botocore's 60 s read timeout plus init. Also a cost ceiling: Lambda
+# bills the full duration and does not stop a stream when the viewer disconnects.
+# timeout_seconds = 120
+
+# ── Cost and retention ────────────────────────────────────────────────────────
+
+# Set explicitly because the CloudWatch default is "never expire", which makes
+# logs the largest line item on an otherwise nearly-free deployment.
+# log_retention_days = 14
+
+# The cheapest class still covers North America and Europe.
+# price_class = "PriceClass_100"
+
+# Bounds how long a billed — and possibly abandoned — stream can run.
+# bedrock_max_output_tokens = 1024
