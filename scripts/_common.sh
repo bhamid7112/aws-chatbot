@@ -10,6 +10,10 @@
 # architecture is a script that will one day build amd64 for an arm64 function.
 STACK_DIR="${STACK_DIR:-infra/serverless}"
 
+# Relative to STACK_DIR, because -chdir resolves paths from there. Needed by the
+# fallback in tf_setting below, which evaluates variables rather than outputs.
+VAR_FILE="${VAR_FILE:-../shared.tfvars}"
+
 log()  { printf '\033[1m==>\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -43,14 +47,49 @@ require_tf_output() {
     printf '%s' "$value"
 }
 
+# Resolve one setting that is *also* an input variable, preferring the stack
+# output and falling back to evaluating the variable directly.
+#
+# The fallback exists for the bootstrap sequence. A `-target` apply prunes every
+# output not reachable from the targeted resources, so straight after creating
+# just the ECR repository the registry URL is readable but `lambda_architecture`
+# is not — even though it derives from nothing but a variable. Evaluating the
+# variable works at that point because it needs no resource to exist.
+#
+# Both paths read the same tfvars, so the fallback cannot disagree with what
+# Terraform will use. There is deliberately no hardcoded default: a release that
+# guessed the architecture would build an image the function cannot run.
+tf_setting() {
+    value=$(tf_output "$1")
+    if [ -n "$value" ]; then
+        printf '%s' "$value"
+        return 0
+    fi
+
+    # console prints the value as HCL, so a string arrives quoted.
+    printf 'var.%s\n' "$1" \
+        | terraform -chdir="$STACK_DIR" console -var-file="$VAR_FILE" 2>/dev/null \
+        | sed -e 's/\r$//' -e 's/^"//' -e 's/"$//' \
+        | grep -v '^[[:space:]]*$' \
+        | tail -n 1
+}
+
 # Assembles the --region/--profile flags every aws call in a release needs, so a
 # release cannot authenticate as a different account than the apply did.
+#
+# Returns non-zero rather than calling die, because it runs inside a command
+# substitution where an exit would only leave the subshell and be silently
+# discarded. The caller checks.
 aws_flags() {
-    region=$(require_tf_output aws_region)
-    profile=$(tf_output aws_profile)
+    _region=$(tf_setting aws_region)
+    [ -n "$_region" ] || return 1
 
-    printf -- '--region %s' "$region"
-    [ -n "$profile" ] && printf -- ' --profile %s' "$profile"
+    # Empty is legitimate here: it means the ambient credential chain.
+    _profile=$(tf_setting aws_profile)
+
+    printf -- '--region %s' "$_region"
+    [ -n "$_profile" ] && printf -- ' --profile %s' "$_profile"
+    return 0
 }
 
 # The tag every artifact in a release is named by.

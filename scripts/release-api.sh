@@ -33,13 +33,17 @@ require_commands docker aws git terraform
 cd_repo_root
 
 registry=$(require_tf_output ecr_repository_url)
-architecture=$(require_tf_output lambda_architecture)
+
+architecture=$(tf_setting lambda_architecture)
+[ -n "$architecture" ] || die "Could not resolve lambda_architecture from '$STACK_DIR'. Has it been applied, and does $STACK_DIR/$VAR_FILE exist?"
+
 platform=$(docker_platform "$architecture")
 tag=$(release_tag)
 image="$registry:$tag"
 
-# shellcheck disable=SC2046 # deliberate word splitting: these are separate flags.
-set -- $(aws_flags)
+flags=$(aws_flags) || die "Could not resolve the region from '$STACK_DIR'. Has it been applied, and does $STACK_DIR/$VAR_FILE exist?"
+# shellcheck disable=SC2086 # deliberate word splitting: these are separate flags.
+set -- $flags
 
 log "Releasing $tag for $architecture"
 
