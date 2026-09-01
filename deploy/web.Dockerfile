@@ -38,6 +38,20 @@ COPY frontend/ ./
 # never reaches a bundle. Both are the same commands a developer runs locally.
 RUN npm run check:layers && npm run build
 
+# ── bundle ────────────────────────────────────────────────────────────────────
+# An export target, not an image to run: the serverless deployment serves the
+# bundle from S3, so the compiled output has to reach the local disk.
+#
+#   docker buildx build -f deploy/web.Dockerfile --target bundle \
+#          --output type=local,dest=.build/dist .
+#
+# It hangs off `build` rather than repeating the build, so the check:layers and
+# `tsc -b` gates above apply to the S3 bundle exactly as they do to the Caddy
+# image — one build, one set of gates, two destinations. FROM scratch means the
+# exported tree is the bundle itself with nothing else in it.
+FROM scratch AS bundle
+COPY --from=build /build/dist /
+
 # ── runtime ───────────────────────────────────────────────────────────────────
 FROM caddy:${CADDY_VERSION}-alpine AS runtime
 
