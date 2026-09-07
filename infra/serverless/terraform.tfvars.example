@@ -44,6 +44,24 @@
 # bills the full duration and does not stop a stream when the viewer disconnects.
 # timeout_seconds = 120
 
+# ── Error alerts ──────────────────────────────────────────────────────────────
+
+# Where the two error alarms mail. Set the real value in terraform.tfvars next to
+# this file — gitignored, and auto-loaded with no -var-file flag.
+#
+# Not in ../shared.tfvars: that file is for settings both stacks declare, and
+# ../server has no alert_email, so a value there makes every server-stack command
+# warn about an undeclared variable. Harmless, permanent, and on the wrong stack.
+#
+# Leave it empty and Terraform still creates the topic and both alarms with no
+# subscriber; the `alerts_topic_arn` output prints the command to subscribe by
+# hand.
+#
+# Either way, SNS mails a confirmation link and delivers nothing until it is
+# clicked. Check with the `alerts_subscription_check_command` output: a
+# PendingConfirmation subscription is not an alert.
+# alert_email = "alerts@example.com"
+
 # ── Cost and retention ────────────────────────────────────────────────────────
 
 # Set explicitly because the CloudWatch default is "never expire", which makes

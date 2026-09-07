@@ -21,6 +21,13 @@ locals {
   # must create it *before* the function exists.
   log_group_name = "/aws/lambda/${local.name}-api"
 
+  # The metric the log filter publishes and the alarm watches — two resources
+  # describing one metric, so the identity is written once. A custom namespace
+  # rather than AWS/Lambda: that one is reserved, and PutMetricFilter into it is
+  # rejected.
+  error_metric_namespace = "${local.name}/api"
+  error_metric_name      = "ApiErrorCount"
+
   # The environment the function runs with.
   #
   # Two rules govern what is allowed in here, and both are absolute:

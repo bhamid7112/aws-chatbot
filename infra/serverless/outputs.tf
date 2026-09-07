@@ -81,6 +81,33 @@ output "deployed_image_command" {
   value       = "aws lambda get-function --function-name ${aws_lambda_function.api.function_name} --query 'Code.ImageUri' --output text --region ${var.aws_region}${local.cli_profile_flag}"
 }
 
+output "alerts_topic_arn" {
+  description = <<-EOT
+    Topic the two error alarms publish to. Printed because it is what a manual
+    subscription needs, when `alert_email` is left empty:
+
+      aws sns subscribe --topic-arn <this> --protocol email --notification-endpoint you@example.com
+  EOT
+  value       = aws_sns_topic.alerts.arn
+}
+
+output "alerts_subscription_check_command" {
+  description = "Whether anyone is actually listening. A PendingConfirmation subscription delivers nothing, and that is the state Terraform leaves it in until the confirmation link is clicked."
+  value       = "aws sns list-subscriptions-by-topic --topic-arn ${aws_sns_topic.alerts.arn} --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text --region ${var.aws_region}${local.cli_profile_flag}"
+}
+
+output "alerts_test_command" {
+  description = <<-EOT
+    Drive the alarm into ALARM by hand to prove the topic, the subscription and
+    the mail delivery all work — without having to make the function fail.
+
+    The state is overridden, not faked: CloudWatch fires the alarm actions
+    exactly as it would for a real breach, then re-evaluates against the metric
+    within a minute or two and mails the recovery as well.
+  EOT
+  value       = "aws cloudwatch set-alarm-state --alarm-name ${aws_cloudwatch_metric_alarm.api_log_errors.alarm_name} --state-value ALARM --state-reason 'verifying alert delivery' --region ${var.aws_region}${local.cli_profile_flag}"
+}
+
 output "bedrock_model_arn" {
   description = "The single foundation model the execution role can invoke. Printed so a permission error can be checked against what was actually granted."
   value       = module.bedrock_access.model_arn

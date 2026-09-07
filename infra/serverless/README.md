@@ -42,6 +42,7 @@ Control — is the only caller either one accepts.
 | `locals.tf` | Name prefix, tags, log group name, and the function's environment |
 | `ecr.tf` | Image registry: immutable tags, lifecycle policy, explicit Lambda pull grant |
 | `logs.tf` | The log group, created *before* the function so retention is never absent |
+| `alerts.tf` | Error alerting: metric filter, two alarms, and the SNS topic they mail |
 | `iam.tf` | Execution role: own log group, plus invoke on one Bedrock model |
 | `lambda.tf` | The function. `ignore_changes = [image_uri]` keeps Terraform out of releases |
 | `url.tf` | Function URL (`RESPONSE_STREAM`) and the two permissions CloudFront needs |
@@ -50,8 +51,9 @@ Control — is the only caller either one accepts.
 | `functions/spa-router.js` | Client-side routing at the edge |
 | `outputs.tf` | The URL, and every command used after apply |
 
-20 resources. Compare 17 for the server target — the count is similar, but the
-*shape* is not: nothing here is a host, and nothing here holds state.
+25 resources — 24 if `alert_email` is left empty. Compare 17 for the server
+target: the count is similar, but the *shape* is not. Nothing here is a host,
+and nothing here holds state.
 
 ## Four decisions explain most of the configuration
 
@@ -92,9 +94,9 @@ Control — is the only caller either one accepts.
   provider finds no usable credentials, falls through to instance metadata, and
   fails with `No valid credential sources found` plus a timeout against
   `169.254.169.254` — which reads like a network fault and is not one.
-- Permissions for ECR, Lambda, IAM role/policy, S3, CloudFront and CloudWatch
-  Logs. Wider than the server target's, because a release now touches four
-  services rather than sending one SSM command.
+- Permissions for ECR, Lambda, IAM role/policy, S3, CloudFront, CloudWatch Logs,
+  CloudWatch alarms and SNS. Wider than the server target's, because a release
+  now touches four services rather than sending one SSM command.
 - Bedrock access to the model in `bedrock_region`:
 
   ```powershell
@@ -104,7 +106,11 @@ Control — is the only caller either one accepts.
   `modelLifecycle.status` must be `ACTIVE` and `responseStreamingSupported` must
   be `true`. This model has **no** cross-region inference profile, so
   `bedrock_region` must be a region that actually offers it.
-- No email address, no domain, no certificate. All of that is gone.
+- No domain and no certificate. All of that is gone — CloudFront supplies a
+  trusted one, replacing the hardest part of the server target with one line.
+  An email address is still worth having, but for a different reason than there:
+  not to register with a certificate authority, only to receive error alerts, and
+  the deployment works without one. See [Error alerts](#error-alerts).
 
 ### Shell note
 
@@ -145,6 +151,7 @@ default):
 | `timeout_seconds` | `120` | Must exceed botocore's 60 s read timeout plus init. Also a cost ceiling |
 | `log_retention_days` | `14` | Set explicitly: the CloudWatch default is "never expire" |
 | `price_class` | `PriceClass_100` | Cheapest class still covers North America and Europe |
+| `alert_email` | `""` | Where error alarms mail. This stack only — **not** `../shared.tfvars`, which `../server` would warn about. Empty still creates the topic. See [Error alerts](#error-alerts) |
 
 ## First deploy
 
@@ -317,6 +324,155 @@ Current numbers on this deployment: init **≈6.4 s**, warm `/api/health` **≈1
 a full canned stream **≈550 ms**, `Max Memory Used` **≈97 MB of 1536**. Memory is
 buying CPU for init, not working set.
 
+## Error alerts
+
+Tailing logs only helps when you already know something is wrong. `alerts.tf`
+closes that gap: two alarms publish to one SNS topic, which mails
+`alert_email`.
+
+```
+log group ──► metric filter (ApiErrorCount) ──► alarm ──┐
+                                                        ├──► SNS ──► email
+        AWS/Lambda Errors ────────────────────► alarm ──┘
+```
+
+**Two alarms, because neither one sees the other's failures.**
+
+| Alarm | Catches | Misses |
+| --- | --- | --- |
+| `<project>-api-log-errors` | What the application reports: a Bedrock call the adapter could not complete, an unhandled exception in a route | Anything that kills the process before it can log |
+| `<project>-api-invocation-errors` | What Lambda counts: OOM kill, failed init, timeout | Application errors — the function returned a response, so Lambda calls the invocation a success |
+
+The first alarm exists because an application error is invisible to Lambda's own
+metrics. `bedrock_reply_generator.py` catches the failure, logs it and returns a
+502 to the browser — a perfectly successful invocation as far as `AWS/Lambda
+Errors` is concerned.
+
+**The log half depends on the application emitting a level with each record.**
+`backend/app/infrastructure/logging.py` installs a root handler formatted
+`LEVELNAME logger: message`. Without it, records fall through to Python's
+`lastResort` handler, which writes the bare message with no level in it — and a
+metric filter matching on text finds nothing. The alert would then stay silent
+in exactly the case it exists for, which is why the coupling is asserted in
+`backend/tests/test_logging.py` rather than left to a comment.
+
+The filter pattern is an OR across four terms: `ERROR`, `CRITICAL`,
+`Task timed out`, `Runtime exited with error`.
+
+Both alarms fire on **one** breaching datapoint in a 60-second period, with
+`treat_missing_data = "notBreaching"` and `ok_actions` set so recovery mails too.
+That is more sensitive than the usual "2 of 5" advice, deliberately: that advice
+is for rate thresholds on busy services, where one error in ten thousand
+invocations is noise. Here the threshold is *zero* on low traffic, so an error is
+rare, always unexpected, and worth knowing about the first time.
+
+### Setting the address
+
+`alert_email` goes in **`infra/serverless/terraform.tfvars`** — gitignored, and
+auto-loaded with no `-var-file` flag. Create it if it does not exist; every other
+value in it is optional, so a one-line file is valid:
+
+```powershell
+Set-Content infra/serverless/terraform.tfvars 'alert_email = "you@example.com"' -Encoding utf8
+terraform -chdir=infra/serverless apply -var-file=../shared.tfvars
+```
+
+**Not `../shared.tfvars`.** That file is for settings *both* stacks declare, and
+`../server` has no `alert_email`, so a value there makes every server-stack
+command print:
+
+```
+Warning: Value for undeclared variable
+The root module does not declare a variable named "alert_email" but a value was found in file "../shared.tfvars".
+```
+
+A warning, not an error — so it works, and then warns forever on the stack that
+has nothing to do with alerting.
+
+Neither file is required. `-var 'alert_email=you@example.com'` on the command
+line works too, and leaving the variable unset is a supported outcome: Terraform
+creates the topic and both alarms with no subscriber, and `alerts_topic_arn`
+prints the command to subscribe by hand. That is the better route if the address
+should not sit in a file at all.
+
+### Verifying the filter pattern
+
+A pattern that matches nothing fails silently — the alarm simply never fires —
+so it is worth checking against real log lines rather than reading it. AWS will
+evaluate it for you, and the call is read-only:
+
+```powershell
+aws logs test-metric-filter --region us-east-2 --profile <name> --filter-pattern '?ERROR ?CRITICAL ?\"Task timed out\" ?\"Runtime exited with error\"' --log-event-messages 'ERROR app.infrastructure.bedrock_reply_generator: Bedrock rejected or dropped a converse_stream call' 'START RequestId: abc Version: $LATEST' 'REPORT RequestId: abc Duration: 46.12 ms Billed Duration: 47 ms'
+```
+
+The first message must match and the other two must not. A `REPORT` line
+matching would mean an alert on every successful invocation.
+
+**The `\"` escapes are required and are not a typo.** PowerShell 5.1 strips
+double quotes from an argument before handing it to a native executable — even
+inside single quotes — and the C runtime then splits the pattern on spaces into
+several arguments, so the CLI reports the fragments as `Unknown options`.
+Escaping them keeps the pattern one argument. Under Git Bash the plain form
+works and the escapes are unnecessary.
+
+For a request with no shell quoting at all, put it in a file:
+
+```json
+{
+    "filterPattern": "?ERROR ?CRITICAL ?\"Task timed out\" ?\"Runtime exited with error\"",
+    "logEventMessages": [
+        "ERROR app.infrastructure.bedrock_reply_generator: Bedrock rejected or dropped a converse_stream call",
+        "REPORT RequestId: abc Duration: 46.12 ms Billed Duration: 47 ms"
+    ]
+}
+```
+
+```powershell
+aws logs test-metric-filter --cli-input-json file://test-metric-filter.json --region us-east-2 --profile <name>
+```
+
+### Confirming the subscription
+
+**SNS cannot confirm an email subscription for you.** Terraform creates it, SNS
+mails a confirmation link, and until someone clicks it the endpoint sits at
+`PendingConfirmation` and **delivers nothing**. An apply that succeeds is not yet
+a working alert.
+
+```powershell
+terraform -chdir=infra/serverless output -raw alerts_subscription_check_command   # copy and run it
+```
+
+A `SubscriptionArn` of literally `PendingConfirmation` means the link is still
+unclicked. It expires after three days, and a `terraform destroy` cannot remove
+an unconfirmed subscription — only time does.
+
+### Verifying delivery
+
+Prove the topic, the subscription and the mail all work without waiting for a
+real failure:
+
+```powershell
+terraform -chdir=infra/serverless output -raw alerts_test_command   # copy and run it
+```
+
+That overrides the alarm's state rather than faking it: CloudWatch fires the
+alarm actions exactly as it would for a real breach, then re-evaluates against
+the metric within a minute or two and mails the recovery as well. Two emails
+means the whole path works.
+
+Note what the email *does not* contain: the log text. A CloudWatch alarm
+notification carries the alarm name, the metric and a timestamp — nothing from
+the log event that tripped it. Go read the log group; the alarm description names
+the `api_log_command` output for exactly that reason. Putting the error text in
+the mail would take a subscription filter and a forwarder function, which is a
+second Lambda to own for a deployment with one operator.
+
+### Cost
+
+One custom metric and two alarms, roughly **$0.70/month**. Metric filters
+themselves are free. Worth stating on a stack that is otherwise pennies: the
+alerting is the line item.
+
 ## Teardown
 
 ```powershell
@@ -358,6 +514,12 @@ one way it costs money while idle. Here an idle deployment is pennies of storage
 | A deep path returns 404 instead of the app | The SPA function is not attached to the default behaviour, or the path contains a dot and was treated as a file. See `functions/spa-router.js`. |
 | Plan wants to change `image_uri` | It should not — `lifecycle { ignore_changes = [image_uri] }` exists precisely because the API reports a digest where the configuration names a tag. If you see it, that block was removed. |
 | Destroy hangs for a long time on CloudFront | Expected. It must be disabled before deletion. |
+| `Unknown options: ?Task timed out, ?CRITICAL …` from `aws logs test-metric-filter` | PowerShell 5.1 strips the double quotes inside the filter pattern before handing the argument to a native exe, and the C runtime then splits it on spaces into several arguments. Escape them as `\"` even inside single quotes, or pass the whole request with `--cli-input-json`. See [Verifying the filter pattern](#verifying-the-filter-pattern). |
+| No alert email ever arrives, but the alarm shows ALARM in the console | The subscription is still `PendingConfirmation` — SNS mailed a link nobody clicked, and it delivers nothing until then. Check with the `alerts_subscription_check_command` output. |
+| Errors appear in the log group but the log alarm stays OK | The records carry no level, so the filter matches nothing. Confirm the line reads `ERROR app.infrastructure...: ...` and not a bare message; if it is bare, `configure_logging()` is not being called — see `backend/app/main.py`. |
+| The log alarm sits in INSUFFICIENT_DATA | `default_value = "0"` is missing from the metric filter, so the metric only exists in minutes that contained an error. See `alerts.tf`. |
+| Both alarms mail for the same failure | Correct, and not a bug: a timeout is both a logged `Task timed out` line and a counted Lambda error. Two mails for one cause is the accepted price of neither alarm having blind spots. |
+| Destroy leaves an SNS subscription behind | An unconfirmed subscription cannot be deleted through the API. It expires on its own after three days. |
 
 ## Known limits
 

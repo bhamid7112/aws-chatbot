@@ -169,6 +169,42 @@ variable "timeout_seconds" {
   }
 }
 
+variable "alert_email" {
+  description = <<-EOT
+    Address the error alarms mail. Empty creates the topic and the alarms with no
+    subscriber, for the case where the address should not be in a tfvars file at
+    all — subscribe by hand afterwards with the command in `alerts_topic_arn`.
+
+    Belongs in this directory's `terraform.tfvars`, which is gitignored and
+    auto-loaded — no `-var-file` flag needed. Not in ../shared.tfvars: that file
+    is for settings *both* stacks declare, and ../server has no alert_email, so
+    a value there makes every server-stack command emit a "Value for undeclared
+    variable" warning. A warning rather than an error, so it works — it is just
+    noise on the wrong stack forever.
+
+    Not in terraform.tfvars.example either. An address committed to the
+    repository is one that cannot be changed without a commit, and it does not
+    belong in git in the first place.
+
+    SNS cannot confirm an email subscription on its own. Terraform creates it,
+    SNS mails a confirmation link, and until someone clicks it the endpoint reads
+    "PendingConfirmation" and **delivers nothing** — a plan that applies cleanly
+    is not yet a working alert. A destroy cannot remove an unconfirmed
+    subscription either; it expires by itself after three days.
+
+    A team alias generally outlives an individual address, and an alert nobody
+    receives is worse than no alert, because it reads as silence rather than as
+    a gap.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.alert_email == "" || can(regex("^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$", var.alert_email))
+    error_message = "alert_email must be a single email address, or empty to create the topic with no subscription."
+  }
+}
+
 variable "log_retention_days" {
   description = "CloudWatch retention for the function's log group. Set explicitly because the default is \"never expire\", which makes logs the largest line item on a low-traffic deployment."
   type        = number
