@@ -98,20 +98,30 @@ export class SseChatGateway implements ChatGateway {
     history: readonly Message[],
     signal?: AbortSignal,
   ): Promise<Response> {
+    // Rebuilt rather than passed through, so nothing the UI happens to keep on an
+    // entry can leak into the request body. Built once, because the payload hash
+    // below has to be taken over the exact bytes that get sent.
+    const body = JSON.stringify({
+      message,
+      history: history.map(({ role, content }) => ({ role, content })),
+    })
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+    }
+
+    const payloadHash = await sha256Hex(body)
+    if (payloadHash !== null) {
+      headers['x-amz-content-sha256'] = payloadHash
+    }
+
     let response: Response
     try {
       response = await fetch(this.endpoint, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'text/event-stream',
-        },
-        // Rebuilt rather than passed through, so nothing the UI happens to keep
-        // on an entry can leak into the request body.
-        body: JSON.stringify({
-          message,
-          history: history.map(({ role, content }) => ({ role, content })),
-        }),
+        headers,
+        body,
         cache: 'no-store',
         // `null`, not `undefined`: RequestInit declares the absence of a signal
         // as null, and exactOptionalPropertyTypes holds it to that.
@@ -129,6 +139,44 @@ export class SseChatGateway implements ChatGateway {
     if (response.ok) return response
     throw await toRejection(response)
   }
+}
+
+/**
+ * Hex SHA-256 of the request body, or `null` if this browser cannot compute one.
+ *
+ * ── Why a request body needs a hash at all ──────────────────────────────────
+ *
+ * On the serverless target CloudFront reaches the API through Origin Access
+ * Control, which signs each origin request with SigV4 — and a SigV4 signature
+ * covers the body. CloudFront cannot hash a body it is streaming through, and
+ * Lambda does not accept `UNSIGNED-PAYLOAD`, so the *viewer* supplies the digest
+ * and CloudFront signs using it. Without this header a POST is rejected with 403,
+ * which was confirmed by removing it against a real distribution.
+ *
+ * Note what this is **not**: the browser holds no AWS credentials and signs
+ * nothing. It contributes one hash of its own request body.
+ *
+ * ── Why the same bundle still serves both deployment targets ────────────────
+ *
+ * On the EC2 target Caddy neither reads nor forwards this header, so sending it
+ * is harmless there — which is what allows one bundle to be both baked into the
+ * Caddy image and synced to S3, rather than built twice with different flags.
+ *
+ * `crypto.subtle` exists only in a secure context. HTTPS via CloudFront
+ * qualifies, and so do `http://localhost` and `127.0.0.1`, so the compose stack
+ * and the Vite dev server are unaffected. Reaching a local stack over a LAN
+ * address is the one case that is neither, and there the header is returned as
+ * `null` and simply omitted instead of throwing — correct, because the only
+ * target that requires the header is served exclusively over HTTPS.
+ */
+async function sha256Hex(body: string): Promise<string | null> {
+  if (typeof crypto === 'undefined' || crypto.subtle === undefined) return null
+
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body))
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
 }
 
 /**

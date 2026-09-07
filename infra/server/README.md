@@ -1,7 +1,11 @@
-# Infrastructure
+# Server target
 
 One `terraform apply` produces a running, HTTPS-serving chatbot on a stable
 public IP, with no domain name involved.
+
+One of two deployment targets — see [../README.md](../README.md) for how this one
+compares with [../serverless](../serverless), and for the shared variables both
+stacks read from `../shared.tfvars`.
 
 | File | Holds |
 | --- | --- |
@@ -11,7 +15,7 @@ public IP, with no domain name involved.
 | `locals.tf` | Name prefix, tags, repo root, Compose download URL |
 | `network.tf` | Dedicated VPC, public subnet, IGW, route table, AZ selection |
 | `security.tf` | Security group and its rules. No port 22 anywhere |
-| `iam.tf` | Instance role: SSM managed node access, plus invoke on one Bedrock model |
+| `iam.tf` | Instance role: SSM managed node access, plus invoke on one Bedrock model — the invoke policy comes from [../modules/bedrock_access](../modules/bedrock_access), shared with the serverless target so the two cannot drift apart |
 | `compute.tf` | Elastic IP, AL2023 instance, EIP association |
 | `outputs.tf` | The URL, and the commands used after apply |
 | `templates/user_data.sh.tftpl` | First-boot bootstrap and the deploy command it installs |
@@ -62,11 +66,11 @@ Three decisions explain most of the file:
 ## First deploy
 
 ```powershell
-cd infra
+cd infra/server
 Copy-Item terraform.tfvars.example terraform.tfvars   # then edit acme_email
 terraform init
 terraform validate
-terraform plan          # read it: 16 resources to add, none destroyed
+terraform plan          # read it: 17 resources to add, none destroyed
 terraform apply
 ```
 
@@ -87,7 +91,7 @@ Run these in **Git Bash**, not PowerShell: `curl` and `openssl` are both on its
 `PATH`, and a JSON body survives its quoting unchanged.
 
 ```bash
-IP=$(cd /d/aws-chatbot/infra && terraform output -raw public_ip)
+IP=$(terraform -chdir=/d/aws-chatbot/infra/server output -raw public_ip)
 
 # 1. A real certificate: 200, and no -k anywhere.
 curl -sSI "https://$IP"

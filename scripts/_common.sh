@@ -4,6 +4,19 @@
 # shell is Git Bash and infra/README.md already directs verification steps there.
 # Nothing here uses a bashism.
 
+# Git Bash rewrites any argument that looks like an absolute POSIX path into a
+# Windows path before the program sees it. That silently corrupts arguments which
+# are not filesystem paths at all: `--paths /index.html` reaches the AWS CLI as
+# "C:/Program Files/Git/index.html" and CloudFront rejects the invalidation, and
+# `--log-group-name /aws/lambda/...` fails the same way.
+#
+# The failure is worth guarding against rather than working around per call,
+# because it is invisible in the script and the error names neither the shell nor
+# the rewrite. Both variables are MSYS-specific and simply unset on Linux and
+# macOS, so exporting them here costs nothing there.
+export MSYS_NO_PATHCONV=1
+export MSYS2_ARG_CONV_EXCL='*'
+
 # The serverless stack is the only source of truth for where a release goes. The
 # scripts read it rather than holding their own copies of the registry URL,
 # region, profile or architecture — a script with its own copy of the

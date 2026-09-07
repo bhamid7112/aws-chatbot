@@ -23,10 +23,18 @@ SSE_MEDIA_TYPE = "text/event-stream"
 DONE_SENTINEL = "[DONE]"
 
 STREAM_HEADERS = {
-    # no-transform additionally forbids proxies from re-chunking the body
+    # no-transform additionally forbids proxies from re-chunking the body — which
+    # now has two audiences: Caddy on the server target, and CloudFront on the
+    # serverless one, where the /api/* behaviour also disables edge compression
+    # because compressing a body requires buffering it.
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
-    # Belt and braces alongside Caddy's flush_interval -1
+    # Belt and braces alongside Caddy's flush_interval -1, and the same for any
+    # buffering reverse proxy that honours it. Neither deployment target is known
+    # to need it: Caddy flushes text/event-stream on its own, and CloudFront was
+    # measured forwarding frames at their original 0.06s cadence. It stays because
+    # word-by-word delivery is the only behaviour this application has, and that
+    # should not rest on two proxies' defaults staying as they are.
     "X-Accel-Buffering": "no",
 }
 

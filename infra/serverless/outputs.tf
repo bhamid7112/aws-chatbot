@@ -5,13 +5,18 @@
 # account.
 
 output "site_url" {
-  description = "The deployment's address. During Phase 0 only /api/* answers here; the bundle arrives with site.tf."
+  description = "The deployment's address — the bundle and the API behind one hostname, which is why the frontend needs no API base URL."
   value       = "https://${aws_cloudfront_distribution.site.domain_name}"
 }
 
 output "distribution_id" {
   description = "CloudFront distribution id, needed to invalidate the cache after a bundle upload."
   value       = aws_cloudfront_distribution.site.id
+}
+
+output "site_bucket" {
+  description = "Bucket holding the React bundle. Private — reachable only through the distribution, so `aws s3 ls` works for the operator but there is no public URL."
+  value       = aws_s3_bucket.site.id
 }
 
 output "ecr_repository_url" {

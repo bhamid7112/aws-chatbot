@@ -1,11 +1,20 @@
 # AWS Chatbot
 
 A streaming chat application — React front end, FastAPI back end, Server-Sent
-Events between them — deployed to a single EC2 instance behind Caddy, reachable
-over genuine HTTPS **on a bare IP address with no domain name involved**.
+Events between them — deployable to AWS **two ways, from one codebase**:
 
-One `terraform apply` produces the running site. One `git push` plus one SSM
-command ships a new version of it.
+- **Server** — a single EC2 instance behind Caddy, reachable over genuine HTTPS
+  **on a bare IP address with no domain name involved**.
+- **Serverless** — CloudFront and S3 in front of a Lambda function, streaming SSE
+  end to end.
+
+Both run the *same* image and the same `uvicorn app.main:app` process. There is no
+handler, no Mangum and no ASGI shim anywhere in `backend/`: the serverless target
+cost **zero** lines of application code, and the frontend's only concession is one
+request header. Choosing between them is
+[a table in infra/README.md](infra/README.md#choosing-a-target).
+
+### Server target
 
 ```
 ┌─────────┐   https://<elastic-ip>     ┌──────────────────────────────────┐
@@ -28,6 +37,29 @@ command ships a new version of it.
 Caddy is the only way in. The API publishes no host port in any environment, so
 there is no route to it that bypasses the edge.
 
+One `terraform apply` produces the running site. One `git push` plus one SSM
+command ships a new version of it.
+
+### Serverless target
+
+```
+┌─────────┐  https://<id>.cloudfront.net  ┌─────────────────────────────┐
+│ browser │ ────────────────────────────►  │ CloudFront                  │
+└─────────┘  one origin, one certificate   │  default ─► S3 (private)    │
+                                           │  /api/*  ─► Function URL    │
+                                           └──────────────┬──────────────┘
+                                                          ▼
+                                           ┌─────────────────────────────┐
+                                           │ Lambda (container image)    │
+                                           │  lambda-adapter extension   │
+                                           │  └─► uvicorn + FastAPI, SSE │
+                                           └─────────────────────────────┘
+```
+
+CloudFront is the only way in here too, by the same principle: S3 blocks all
+public access and the Function URL requires `AWS_IAM`, so Origin Access Control
+signing is the only thing either origin accepts.
+
 ## Contents
 
 - [Tech stack](#tech-stack)
@@ -36,6 +68,8 @@ there is no route to it that bypasses the edge.
 - [Running locally](#running-locally)
 - [How SSL works](#how-ssl-works)
 - [Deployment](#deployment)
+  - [Server target](#server-target-1)
+  - [Serverless target](#serverless-target-1)
 
 ## Tech stack
 
@@ -49,10 +83,12 @@ there is no route to it that bypasses the edge.
 | Python tooling | **uv** (`uv.lock` committed), ruff, mypy `strict` | Lockfile-exact installs in every environment, including inside the image (`uv sync --locked`). |
 | Containers | Docker + Compose, multi-stage builds | Two images: `api` (Python) and `web` (Caddy with the compiled bundle baked in). |
 | Edge | Caddy 2.11 | Automatic HTTPS with ACME built in — and, critically, it can obtain a certificate for an IP address. |
-| Host | One EC2 `t3.micro`, Amazon Linux 2023, Elastic IP | Free-tier eligible. A load balancer cannot present a certificate for an address it does not own, so the certificate lives where the address lives. |
+| Host — server | One EC2 `t3.micro`, Amazon Linux 2023, Elastic IP | Free-tier eligible. A load balancer cannot present a certificate for an address it does not own, so the certificate lives where the address lives. |
+| Host — serverless | Lambda container image + **Lambda Web Adapter**, behind a Function URL in `RESPONSE_STREAM` mode | The adapter runs the *unmodified* uvicorn process, so the backend needs no Lambda-specific code. A Function URL is the only serverless HTTP front door that can stream SSE — REST APIs buffer the body, HTTP APIs cap at 30 s. |
+| Edge — serverless | CloudFront with Origin Access Control to both origins | One hostname for bundle and API, so CORS stays off and the frontend still holds no API base URL. Brings an AWS-managed certificate, which deletes the entire ACME apparatus. |
 | Model | Google **Gemma 3 27B IT** on Amazon Bedrock, via the streaming Converse API | An open-weight instruction-tuned model with a 128K context, served on-demand with no endpoint to keep warm. Bedrock means one API and no vendor SDK of its own. |
-| Infrastructure | Terraform (AWS provider), local state | 17 resources: dedicated VPC, public subnet, IGW, security group, IAM instance role, scoped Bedrock invoke policy, EIP, instance. |
-| Access | SSM Session Manager | No SSH, no port 22, no key pair anywhere in the configuration. |
+| Infrastructure | Terraform (AWS provider), local state, **two root stacks + a shared module** | 17 resources for the server target, 20 for serverless. Separate state per stack, so destroying one cannot touch the other. |
+| Access | SSM Session Manager (server); CloudWatch Logs (serverless) | No SSH, no port 22, no key pair anywhere in either configuration. |
 
 Replies come from **Gemma 3 27B on Amazon Bedrock**, streamed token by token to
 the browser. The original canned generator is still there and still supported —
@@ -195,7 +231,8 @@ with the console session (12 hours at most), and a long-term one is a static
 IAM-user credential in a file on a public-facing host — in a deployment that
 otherwise has no SSH key, no key pair and no stored secret of any kind. The
 instance role gives short-lived credentials, scoped in
-[infra/iam.tf](infra/iam.tf) to `InvokeModel` on one model ARN and nothing else,
+[infra/modules/bedrock_access/](infra/modules/bedrock_access/) to `InvokeModel` on one
+model ARN and nothing else — the same grant for both targets,
 with every call attributable in CloudTrail.
 
 Nothing secret is ever written to `deploy/.env`. On the instance that file is
@@ -227,7 +264,11 @@ Every variable is optional (see
 | [backend/](backend/) | The API: `app/` in four layers, `tests/`, `pyproject.toml`, `uv.lock` |
 | [frontend/](frontend/) | The UI: `src/` in four layers, `scripts/check-layers.mjs`, Vite config |
 | [deploy/](deploy/) | `docker-compose.yml`, both Dockerfiles, `caddy/Caddyfile` — everything about running it |
-| [infra/](infra/) | Terraform for the AWS environment. See [infra/README.md](infra/README.md) |
+| [infra/](infra/) | Terraform, one root stack per deployment target. See [infra/README.md](infra/README.md) |
+| [infra/server/](infra/server/) | The EC2 target: VPC, security group, instance role, EIP, instance |
+| [infra/serverless/](infra/serverless/) | The Lambda target: ECR, function, Function URL, S3, CloudFront |
+| [infra/modules/bedrock_access/](infra/modules/bedrock_access/) | Permission to invoke exactly one model — the one thing both targets share |
+| [scripts/](scripts/) | `release-api.sh`, `release-web.sh` — releases for the serverless target only |
 
 ## Running locally
 
@@ -348,7 +389,7 @@ three deliberate lines in [deploy/caddy/Caddyfile](deploy/caddy/Caddyfile):
 
 Because HTTP-01 is the only usable challenge, **port 80 carries every renewal
 for the life of the deployment** — not just the first issuance. It is open to
-`0.0.0.0/0` in [infra/security.tf](infra/security.tf) and cannot be narrowed
+`0.0.0.0/0` in [infra/server/security.tf](infra/server/security.tf) and cannot be narrowed
 even for a private deployment, since Let's Encrypt validates from its own
 unpublished source addresses.
 
@@ -385,7 +426,7 @@ Two safeguards follow from the same concern:
 Run in Git Bash (both `curl` and `openssl` are on its `PATH`):
 
 ```bash
-IP=$(cd infra && terraform output -raw public_ip)
+IP=$(terraform -chdir=infra/server output -raw public_ip)
 
 # A real certificate: 200, no -k anywhere.
 curl -sSI "https://$IP"
@@ -410,20 +451,32 @@ first thing to look at.
 
 ## Deployment
 
-Two things are deliberately separate here: **Terraform owns the environment,
-and it has no part in a release.** `user_data` names a repository and a *ref*,
-not a revision — so shipping code is a `git push` followed by re-running a
-script on the instance, and an infrastructure change can never half-restart a
-running site.
+Two targets, two independent Terraform root stacks, one application. Either can
+be applied, destroyed or left alone without affecting the other: they keep
+separate state and create disjoint resource types, so both can coexist in one
+account.
 
-The instance clones the repository and builds both images itself. That removes
-a registry, an image-push step, an artifact bucket and a second build
-environment to keep in step with the Dockerfiles — and because the repository
-is public, it removes every credential from the host too. The instance role can
-do exactly one thing: be an SSM managed node.
+**Which one to pick** is [a table in infra/README.md](infra/README.md#choosing-a-target).
+The short version: serverless costs pennies when idle and removes the six-day
+certificate cliff, at the price of a ≈6.4 s cold start; the server target has no
+cold start and is cheaper past roughly 25,000 chats a month.
 
-Full detail, including troubleshooting, is in
-[infra/README.md](infra/README.md).
+One principle holds in both, by different mechanisms: **Terraform owns the
+environment, and it has no part in a release.**
+
+- **Server** — `user_data` names a repository and a *ref*, not a revision, so
+  shipping code is a `git push` and one SSM command.
+- **Serverless** — `lifecycle { ignore_changes = [image_uri] }` means the image
+  tag is read once at create and never again; releases go through
+  `scripts/release-*.sh`.
+
+Either way an infrastructure change can never half-ship code, and a release never
+needs an apply.
+
+Full detail and troubleshooting for both is in
+[infra/README.md](infra/README.md), which links each target's own README.
+
+## Server target
 
 ### Prerequisites
 
@@ -438,11 +491,11 @@ Full detail, including troubleshooting, is in
 ### First deploy
 
 ```powershell
-cd infra
+cd infra/server
 Copy-Item terraform.tfvars.example terraform.tfvars   # then set acme_email
 terraform init
 terraform validate
-terraform plan          # read it: 16 to add, none destroyed
+terraform plan          # read it: 17 to add, none destroyed
 terraform apply
 ```
 
@@ -458,7 +511,7 @@ The log ends with `=== bootstrap finished` and a `docker compose ps` listing
 both containers. Then verify TLS as [above](#verifying-it).
 
 What first boot does, in order
-([user_data.sh.tftpl](infra/templates/user_data.sh.tftpl)):
+([user_data.sh.tftpl](infra/server/templates/user_data.sh.tftpl)):
 
 1. creates a 2 GiB swapfile — `npm run build` peaks above what a `t3.micro`'s
    1 GiB leaves free, and the OOM killer takes node mid-build
@@ -491,20 +544,6 @@ sudo tail -f /var/log/aws-chatbot-deploy.log
 sudo /usr/local/bin/aws-chatbot-deploy          # idempotent; safe to re-run
 ```
 
-### Build gates
-
-A release cannot ship broken layering or a type error, because both image
-builds fail first:
-
-- `api.Dockerfile` — `uv sync --locked` fails on a stale `uv.lock`; a `test`
-  stage runs the suite against the image itself
-- `web.Dockerfile` — `npm ci` fails on a stale lockfile, then
-  `npm run check:layers && npm run build` runs the dependency-rule check and
-  `tsc -b` before Vite; finally `caddy validate` is run against **both**
-  `SITE_ADDRESS` shapes (local `http://localhost` and a production IP literal),
-  so a Caddyfile change cannot silently break the production path that can't be
-  exercised locally
-
 ### Shell access
 
 ```powershell
@@ -517,7 +556,7 @@ Docker.
 ### Teardown
 
 ```powershell
-cd infra
+cd infra/server
 terraform destroy
 ```
 
@@ -528,7 +567,7 @@ nothing.
 
 ### Operational notes
 
-- **Terraform state is local.** `infra/terraform.tfstate` is the only record of
+- **Terraform state is local, per stack.** `infra/<target>/terraform.tfstate` is the only record of
   what exists, and it is gitignored. Back it up before anything destructive;
   moving to S3 is a `backend "s3"` block plus `terraform init -migrate-state`.
 - **The repository must stay public.** Cloning uses no credentials, which is
@@ -540,3 +579,142 @@ nothing.
 - **`git_ref = "main"` is not pinned.** A redeploy ships whatever was last
   pushed, including someone else's push. Set `git_ref` to a tag or a commit SHA
   when a deployment needs to be reproducible — the fetch accepts all three.
+
+## Serverless target
+
+Full detail, including a troubleshooting table, is in
+[infra/serverless/README.md](infra/serverless/README.md). This is the summary.
+
+The application is unchanged. The **Lambda Web Adapter** — a Lambda extension
+that ships the runtime interface client — starts the image's own
+`uvicorn app.main:app` and turns each invocation into an HTTP request against it.
+So `backend/` gains no handler, no dependency and no branch on "am I on Lambda".
+
+### Prerequisites
+
+- Terraform ≥ 1.9, AWS CLI v2, git, and **Docker with buildx** on `PATH`, with a
+  live session (`aws sso login --profile <name>`)
+- Bedrock access to the model in `bedrock_region` — `modelLifecycle.status` must
+  be `ACTIVE` and `responseStreamingSupported` must be `true`
+- No email address, no domain, no certificate. All of that is gone.
+
+Docker is the new prerequisite: **the build moves from the instance to your
+workstation**, because the image has to reach a registry.
+
+### Shared variables
+
+Five settings belong to both stacks. Terraform cannot share a tfvars file across
+root modules, so the invocation carries it — copy `infra/shared.tfvars.example`
+to `infra/shared.tfvars` and pass `-var-file=../shared.tfvars` to every command.
+Omitting it is not an error; it silently falls back to defaults.
+
+### First deploy
+
+Bootstrap is **two applies**: an `Image` function cannot be created before its
+image exists, and the image cannot be pushed before the registry exists.
+
+```powershell
+terraform -chdir=infra/serverless init
+terraform -chdir=infra/serverless apply -var-file=../shared.tfvars -target=aws_ecr_repository.api -target=aws_ecr_lifecycle_policy.api -target=aws_ecr_repository_policy.api
+```
+
+```bash
+bash ./scripts/release-api.sh --skip-update      # prints the image tag
+```
+
+```powershell
+terraform -chdir=infra/serverless apply -var-file=../shared.tfvars -var="image_tag=<TAG>"
+```
+
+```bash
+bash ./scripts/release-web.sh                    # until this runs, / returns S3's 404
+```
+
+Allow 3–8 minutes for the CloudFront distribution. Then
+`terraform -chdir=infra/serverless output -raw site_url`.
+
+The release scripts are POSIX `sh` and need Git Bash; prefixing with `bash` works
+from PowerShell too. Terraform commands are given on one line because PowerShell
+does not treat `\` as a line continuation.
+
+### Releasing a change
+
+Three kinds of change, three commands — knowing which is which is most of
+operating this target:
+
+```bash
+git push && bash ./scripts/release-api.sh        # backend
+bash ./scripts/release-web.sh                    # frontend
+```
+
+```powershell
+terraform -chdir=infra/serverless apply -var-file=../shared.tfvars   # config/infrastructure
+```
+
+`release-api.sh` pushes under the commit SHA, updates the function by **digest**,
+and waits for `Active` — a container-image update goes `Pending` while Lambda
+re-optimises the image and rejects invocations until it finishes.
+
+`release-web.sh` uploads assets first with a one-year immutable cache and
+`index.html` last with `no-cache`, so the shell is never newer than the chunks it
+names. It never uses `--delete`: the previous release's content-hashed chunks
+must survive for tabs still open on the old bundle.
+
+### Observability
+
+```powershell
+terraform -chdir=infra/serverless output -raw api_log_command        # aws logs tail --follow
+terraform -chdir=infra/serverless output -raw deployed_image_command # what is actually running
+```
+
+There is no host to inspect and no `git log` to run — the deployed revision is an
+image digest. Better in steady state, worse the first time init fails and there
+is no shell to get a stack trace from.
+
+### Teardown
+
+```powershell
+terraform -chdir=infra/serverless destroy -var-file=../shared.tfvars
+```
+
+15+ minutes: CloudFront must be disabled before it can be deleted. `force_delete`
+on the registry and `force_destroy` on the bucket mean a non-empty repository and
+bucket do not block it — neither holds anything that is not rebuildable from a
+commit.
+
+Unlike the server target there is **no standing cost to leaving this deployed**.
+
+### Operational notes
+
+- **Cold starts are real and billed.** ≈6.4 s init; the first request cost
+  6399 ms of billed duration for 46 ms of work. Container images cannot use
+  SnapStart, and provisioned concurrency would erase the cost advantage.
+- **Lambda bills the full duration and does not stop a stream when the viewer
+  disconnects.** Abandoned chats are routine, and each bills to completion or
+  timeout. `timeout_seconds` and `bedrock_max_output_tokens` are the bounds. The
+  server target has no equivalent exposure.
+- **A release is not atomic.** Bundle upload, cache invalidation and the function
+  update are three independently-timed steps, so a frontend expecting a new API
+  contract needs the API released first.
+- **No VPC, deliberately.** The function calls only public AWS endpoints, so
+  there is no NAT gateway to pay for — and a VPC would break Function URL
+  response streaming outright.
+- **No custom domain.** A custom domain needs ACM in **us-east-1** specifically,
+  which brings back a provider alias this stack currently does without.
+
+## Build gates
+
+Shared by both targets, because both build from the same two Dockerfiles. A
+release cannot ship broken layering or a type error, because the image build
+fails first:
+
+- `api.Dockerfile` — `uv sync --locked` fails on a stale `uv.lock`; a `test`
+  stage runs the suite against the image itself. The `lambda` stage adds only the
+  adapter binary on top of `runtime`, so it cannot drift from what EC2 runs.
+- `web.Dockerfile` — `npm ci` fails on a stale lockfile, then
+  `npm run check:layers && npm run build` runs the dependency-rule check and
+  `tsc -b` before Vite; finally `caddy validate` is run against **both**
+  `SITE_ADDRESS` shapes (local `http://localhost` and a production IP literal),
+  so a Caddyfile change cannot silently break the production path that can't be
+  exercised locally. The `bundle` stage that S3 receives hangs off the same
+  `build` stage, so the S3 upload passes the identical gates.

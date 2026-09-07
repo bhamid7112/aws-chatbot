@@ -1,25 +1,20 @@
-# The distribution.
+# The distribution — the single origin the browser talks to.
 #
-# ── Phase 0 shape ─────────────────────────────────────────────────────────────
+# Two origins behind one hostname, split by path: the bundle from S3, /api/* from
+# the Function URL. That is what lets the frontend keep posting to the relative
+# path /api/chat and hold no API base URL in any environment, which is the same
+# property deploy/caddy/Caddyfile provides on the EC2 target. It also means the
+# browser's requests are same-origin, so CORS stays switched off entirely.
 #
-# Right now this has one origin — the Function URL — and its *default* behaviour
-# carries the API. That is temporary. Once site.tf exists, S3 becomes the default
-# origin and the block below moves verbatim into an `ordered_cache_behavior` for
-# the `/api/*` path pattern.
+# ── History worth keeping ─────────────────────────────────────────────────────
 #
-# The arguments are already the ones the permanent `/api/*` behaviour needs, and
-# that is the point: whatever this configuration proves about streaming through
-# CloudFront stays true after the move, because nothing about how the API's
-# requests are handled will change. A distribution must have a default
-# behaviour, so during Phase 0 the API is it.
-#
-# ── Why CloudFront at all, rather than the Function URL directly ──────────────
-#
-# The frontend posts to the relative path /api/chat and holds no API base URL in
-# any environment. One origin serving both the bundle and the API preserves that,
-# keeps CORS switched off, and supplies a real hostname with a trusted
-# certificate — replacing the hardest and most fragile part of ../server, a
-# trusted certificate for a bare IP address, with one line below.
+# The /api/* behaviour below was verified before the S3 half existed, as the
+# distribution's *default* behaviour, with CHAT_REPLY_SOURCE=canned. It measured
+# a 60.6 ms median gap between SSE frames against a configured 0.06 s cadence —
+# so CloudFront forwards a chunked response to the viewer as it arrives rather
+# than buffering it. Its arguments are unchanged since that measurement; only its
+# position moved from `default_cache_behavior` to an ordered one. Treat every
+# argument in it as load-bearing and measured, not chosen.
 
 # Managed policies by name rather than by their well-known UUIDs. The IDs are
 # stable, but `Managed-CachingDisabled` says what it does and a UUID does not.
@@ -27,14 +22,21 @@ data "aws_cloudfront_cache_policy" "caching_disabled" {
   name = "Managed-CachingDisabled"
 }
 
+data "aws_cloudfront_cache_policy" "caching_optimized" {
+  name = "Managed-CachingOptimized"
+}
+
 data "aws_cloudfront_origin_request_policy" "all_viewer_except_host_header" {
   name = "Managed-AllViewerExceptHostHeader"
 }
 
-# Signs every origin request with SigV4 so the Function URL's AWS_IAM
-# authorization has something to check. "always" rather than "never" is what
-# makes the URL private in practice: CloudFront becomes the only caller that can
-# produce a valid signature.
+data "aws_cloudfront_response_headers_policy" "security_headers" {
+  name = "Managed-SecurityHeadersPolicy"
+}
+
+# Two OACs, because the signing rules differ by origin type and one cannot serve
+# both. Both sign every request, which is what makes each origin private: S3
+# blocks all public access, and the Function URL requires AWS_IAM.
 resource "aws_cloudfront_origin_access_control" "api" {
   name                              = "${local.name}-api"
   description                       = "OAC for the ${local.name} api Function URL."
@@ -43,11 +45,33 @@ resource "aws_cloudfront_origin_access_control" "api" {
   signing_protocol                  = "sigv4"
 }
 
+resource "aws_cloudfront_origin_access_control" "site" {
+  name                              = "${local.name}-site"
+  description                       = "OAC for the ${local.name} bundle bucket."
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+# Client-side routing, at the edge. See functions/spa-router.js for why the rule
+# is expressed as it is and why /assets/ is excluded explicitly.
+resource "aws_cloudfront_function" "spa_router" {
+  name    = "${local.name}-spa-router"
+  runtime = "cloudfront-js-2.0"
+  comment = "Rewrites application routes to /index.html, leaving real files alone."
+  publish = true
+  code    = file("${path.module}/functions/spa-router.js")
+}
+
 resource "aws_cloudfront_distribution" "site" {
   enabled         = true
   is_ipv6_enabled = true
   comment         = "${local.name} — serverless target"
   price_class     = var.price_class
+
+  # So a request for / returns the app rather than S3's bucket listing denial.
+  # The SPA function handles every other route-shaped path.
+  default_root_object = "index.html"
 
   origin {
     origin_id = "api"
@@ -74,10 +98,51 @@ resource "aws_cloudfront_distribution" "site" {
     }
   }
 
-  # ── the API behaviour ───────────────────────────────────────────────────────
-  # Every argument here is load-bearing. See the Phase 0 note above: this block
-  # becomes `ordered_cache_behavior { path_pattern = "/api/*" ... }` unchanged.
+  origin {
+    origin_id = "site"
+
+    # The *regional* domain name. The global form (bucket.s3.amazonaws.com) can
+    # answer a fresh bucket with a 307 redirect to the regional endpoint, which
+    # CloudFront caches and which then breaks OAC signing.
+    domain_name              = aws_s3_bucket.site.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.site.id
+
+    # No s3_origin_config and no origin_access_identity: those belong to the
+    # legacy OAI mechanism, and setting either alongside an OAC is how a
+    # distribution ends up authenticating two ways and succeeding at neither.
+  }
+
+  # ── the bundle ──────────────────────────────────────────────────────────────
   default_cache_behavior {
+    target_origin_id = "site"
+
+    # Safe here, unlike on the API behaviour: a static asset is a GET, so there
+    # is no request body for a 301 to discard.
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = ["GET", "HEAD", "OPTIONS"]
+    cached_methods  = ["GET", "HEAD"]
+
+    # The bundle is what compression is for. release-web.sh gives assets a
+    # one-year immutable cache and index.html no-cache, so the cache policy's TTLs
+    # defer to those headers rather than fighting them.
+    compress        = true
+    cache_policy_id = data.aws_cloudfront_cache_policy.caching_optimized.id
+
+    response_headers_policy_id = data.aws_cloudfront_response_headers_policy.security_headers.id
+
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.spa_router.arn
+    }
+  }
+
+  # ── the API ─────────────────────────────────────────────────────────────────
+  # Every argument here is load-bearing and was verified by measurement; see the
+  # note at the top of this file. One matcher covers /api/chat, /api/health and
+  # /api/docs, exactly as the Caddyfile's `handle /api/*` does.
+  ordered_cache_behavior {
+    path_pattern     = "/api/*"
     target_origin_id = "api"
 
     # https-only, *not* redirect-to-https. A redirect answers with 301, and a
@@ -101,9 +166,20 @@ resource "aws_cloudfront_distribution" "site" {
     # be the *origin's* domain — both because SigV4 signs Host, and because the
     # URL router matches on it — and this managed policy forwards everything
     # except Host. It also forwards x-amz-content-sha256, which the browser sends
-    # so that OAC can sign a POST body (Lambda does not accept UNSIGNED-PAYLOAD).
+    # so that OAC can sign a POST body (Lambda does not accept UNSIGNED-PAYLOAD);
+    # without that header a POST is rejected with 403, which was confirmed by
+    # removing it.
     origin_request_policy_id = data.aws_cloudfront_origin_request_policy.all_viewer_except_host_header.id
+
+    # No function_association. The SPA rewrite must not touch API paths, or an
+    # unknown one would return the HTML shell instead of FastAPI's 404.
   }
+
+  # No custom_error_response anywhere in this resource, and that is a decision
+  # rather than an omission. It is distribution-level rather than per-behaviour,
+  # so mapping 404 to /index.html would also rewrite the API's errors — and it is
+  # unnecessary, because the SPA function already resolves route-shaped paths and
+  # the bucket policy's ListBucket grant makes a genuine asset miss a real 404.
 
   # No response-completion timeout is set anywhere in this resource, and that is
   # deliberate: AWS documents that when it is left unset CloudFront enforces no
