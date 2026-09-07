@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.infrastructure.config import Settings
+from app.infrastructure.logging import configure_logging
 from app.interfaces.dependencies import get_settings
 from app.interfaces.routes import router
 
@@ -22,6 +23,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     A factory rather than a module-level singleton so tests can construct an app
     with explicit settings instead of reaching into the environment.
     """
+    # First, so that anything logged during the rest of assembly is already
+    # formatted. Belongs here for the same reason the rest of this file does:
+    # installing a handler is a process-wide side effect, and the outermost ring
+    # is the only place allowed to have one.
+    configure_logging()
+
     resolved = settings or get_settings()
 
     app = FastAPI(
