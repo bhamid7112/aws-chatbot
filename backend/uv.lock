@@ -106,6 +106,7 @@ name = "aws-chatbot-api"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "boto3" },
     { name = "fastapi" },
     { name = "pydantic" },
@@ -119,13 +120,14 @@ dev = [
     { name = "pytest-asyncio" },
 ]
 lint = [
-    { name = "boto3-stubs", extra = ["bedrock-runtime"] },
+    { name = "boto3-stubs", extra = ["bedrock-runtime", "dynamodb", "lambda"] },
     { name = "mypy" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4,<5" },
     { name = "boto3", specifier = ">=1.40,<2.0" },
     { name = "fastapi", specifier = ">=0.115,<1.0" },
     { name = "pydantic", specifier = ">=2.9,<3.0" },
@@ -139,7 +141,7 @@ dev = [
     { name = "pytest-asyncio", specifier = ">=0.24" },
 ]
 lint = [
-    { name = "boto3-stubs", extras = ["bedrock-runtime"], specifier = ">=1.40" },
+    { name = "boto3-stubs", extras = ["bedrock-runtime", "dynamodb", "lambda"], specifier = ">=1.40" },
     { name = "mypy", specifier = ">=1.11" },
     { name = "ruff", specifier = ">=0.6" },
 ]
@@ -174,6 +176,12 @@ wheels = [
 [package.optional-dependencies]
 bedrock-runtime = [
     { name = "mypy-boto3-bedrock-runtime" },
+]
+dynamodb = [
+    { name = "mypy-boto3-dynamodb" },
+]
+lambda = [
+    { name = "mypy-boto3-lambda" },
 ]
 
 [[package]]
@@ -509,6 +517,24 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/26/78/542f5804cf0f9e3c1ccbf30917eaa3b4b6002b91965de02d065d7441fc93/mypy_boto3_bedrock_runtime-1.43.62.tar.gz", hash = "sha256:beb70b08ef72cdfd5036bcd3270f2fbac0a2ce5e40f70dfc1d87c4f139d4d7ff", size = 31492, upload-time = "2026-07-31T19:54:15.291Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/b2/e3bff20acd290b909f1c28856d6d8d7984f7f7d5bda299d5957f64e97bb3/mypy_boto3_bedrock_runtime-1.43.62-py3-none-any.whl", hash = "sha256:603d9df54da5029fc0d0e3c09b6db33733af53182bee030c0c7af99e88ed3b39", size = 37865, upload-time = "2026-07-31T19:54:13.959Z" },
+]
+
+[[package]]
+name = "mypy-boto3-dynamodb"
+version = "1.43.64"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/26/7b/6a7649813c7c367c405182d70d5fc4ff5fc531a8d5b0d4d08fa68276ba7c/mypy_boto3_dynamodb-1.43.64.tar.gz", hash = "sha256:8597ddd7d5f92cf00e7aa0875993e5cf09988f017eef41b94d47c08e7675b5d0", size = 50088, upload-time = "2026-08-04T21:37:37.911Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/3a/34904b687c40e88f004df3ae010d4d64093dab6506eafc9f6f322ef8eeb6/mypy_boto3_dynamodb-1.43.64-py3-none-any.whl", hash = "sha256:74f59f05544e7682bd2ee284fea9dc859d6ca5984f60f80c0ac54aa744115ead", size = 60304, upload-time = "2026-08-04T21:37:34.946Z" },
+]
+
+[[package]]
+name = "mypy-boto3-lambda"
+version = "1.43.86"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/41/327af6cf88a913c5eb562cc931a9c9a6688582e2f00b67d77cd1f0cddc95/mypy_boto3_lambda-1.43.86.tar.gz", hash = "sha256:8b31847e36ecf676bc9ec0ceefd114051682176f28a5332a31c5c2b9203d29b1", size = 53295, upload-time = "2026-09-01T19:41:38.126Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/af/81/5ada1e42beb7723c5780bfff738d36191f21321610d41bb7cd6dca574105/mypy_boto3_lambda-1.43.86-py3-none-any.whl", hash = "sha256:13c8625846d73b4792bb87f806298442118747b57c0f9ea13001fe9fd0095cbf", size = 61654, upload-time = "2026-09-01T19:41:35.587Z" },
 ]
 
 [[package]]

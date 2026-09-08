@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Streaming chat API — Clean Architecture, FastAPI, Server-Sent Events."
 requires-python = ">=3.12"
 dependencies = [
+    # Imported directly to run botocore's blocking calls off the event loop. It
+    # arrives transitively via starlette either way, but a module that imports a
+    # package is a module that depends on it, and an undeclared dependency is one
+    # a transitive change can remove without warning.
+    "anyio>=4,<5",
     # The floor is not cosmetic: google.gemma-3-27b-it is a recent addition, and an
     # older botocore ships a service model that rejects the model ID before the
     # request is ever signed.
@@ -30,7 +35,7 @@ lint = [
     # boto3 ships no inline types, and `strict = true` would otherwise force
     # `type: ignore` at every call site. A lint-group dependency rather than a
     # runtime one: the stubs are for mypy and have no business in the image.
-    "boto3-stubs[bedrock-runtime]>=1.40",
+    "boto3-stubs[bedrock-runtime,dynamodb,lambda]>=1.40",
 ]
 
 [tool.uv]
