@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.interfaces.dependencies import ChatJobServiceDep
+from app.interfaces.dependencies import ChatJobRunnerDep
 from app.interfaces.schemas import WorkerAckDTO, WorkerEventDTO
 
 #: No prefix. This is not part of the ``/api`` surface and must not be routed
@@ -41,7 +41,7 @@ router = APIRouter()
 )
 async def handle_event(
     payload: WorkerEventDTO,
-    service: ChatJobServiceDep,
+    runner: ChatJobRunnerDep,
 ) -> WorkerAckDTO:
     """Run one job to completion, or record why it could not be run.
 
@@ -56,5 +56,5 @@ async def handle_event(
     a job that was already claimed must be answered with "handled" rather than
     an error, or the duplicate is retried until it ages out.
     """
-    await service.run(payload.job_id, payload.request.to_domain())
+    await runner.run(payload.job_id, payload.request.to_domain())
     return WorkerAckDTO()

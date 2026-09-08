@@ -18,12 +18,16 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from app.application.chat_job_service import ChatJobService
+from app.application.chat_job_service import ChatJobRunner, ChatJobService
 from app.application.chat_service import ChatService
 from app.domain.entities import JobStatus
 from app.domain.errors import JobDispatchError
-from app.infrastructure.config import ProcessRole, Settings
-from app.interfaces.dependencies import get_chat_job_service
+from app.infrastructure.config import ProcessRole, ReplySource, Settings
+from app.interfaces.dependencies import (
+    get_chat_job_runner,
+    get_chat_job_service,
+    get_job_store,
+)
 from app.main import create_app
 from tests.fakes import FakeJobDispatcher, FakeJobStore, FakeReplyGenerator
 
@@ -33,8 +37,10 @@ def _settings(
     role: ProcessRole = ProcessRole.API,
     table: str = "jobs",
     worker: str = "chatbot-worker",
+    canned: bool = False,
 ) -> Settings:
     return Settings(
+        reply_source=ReplySource.CANNED if canned else ReplySource.BEDROCK,
         reply_word_delay_seconds=0.0,
         cors_allow_origins=(),
         role=role,
@@ -51,19 +57,46 @@ class Harness:
         *,
         role: ProcessRole = ProcessRole.API,
         table: str = "jobs",
+        worker: str = "chatbot-worker",
         dispatcher: FakeJobDispatcher | None = None,
         texts: tuple[str, ...] = ("Hi ", "there"),
     ) -> None:
         self.store = FakeJobStore()
         self.dispatcher = dispatcher or FakeJobDispatcher()
-        self.app = create_app(_settings(role=role, table=table))
-        service = ChatJobService(
-            ChatService(FakeReplyGenerator(texts)),
-            self.store,
-            self.dispatcher,
-            flush_chars=1,
-        )
+        self.app = create_app(_settings(role=role, table=table, worker=worker))
+
+        chat = ChatService(FakeReplyGenerator(texts))
+        service = ChatJobService(chat, self.store, self.dispatcher)
+        runner = ChatJobRunner(chat, self.store, flush_chars=1)
         self.app.dependency_overrides[get_chat_job_service] = lambda: service
+        self.app.dependency_overrides[get_chat_job_runner] = lambda: runner
+
+    def client(self) -> TestClient:
+        return TestClient(self.app)
+
+
+class RealGraphHarness:
+    """An app whose use cases are assembled by the real composition root.
+
+    Exists for one question the harness above cannot ask: does the graph the
+    deployment actually builds *resolve*? Overriding ``get_chat_job_runner``
+    substitutes the very thing whose construction was broken, which is how a
+    worker that could not build its own collaborators passed every test and
+    then failed every event in production.
+
+    Only the store is substituted, and only because it is the one collaborator
+    that would otherwise open a connection to AWS. Everything above it —
+    which use case the route asks for, and therefore what that use case
+    demands — is the real wiring. The canned reply source keeps the rest of the
+    graph AWS-free for the same reason.
+    """
+
+    def __init__(self, *, role: ProcessRole, table: str, worker: str) -> None:
+        self.store = FakeJobStore()
+        self.app = create_app(
+            _settings(role=role, table=table, worker=worker, canned=True)
+        )
+        self.app.dependency_overrides[get_job_store] = lambda: self.store
 
     def client(self) -> TestClient:
         return TestClient(self.app)
@@ -242,3 +275,49 @@ class TestWorkerRoute:
             response = client.post("/events", json={"job_id": "j1"})
 
         assert response.status_code == 422
+
+
+class TestTheRealDependencyGraph:
+    """What the deployment actually builds, with nothing overridden.
+
+    Found in production: the worker's route asked for a use case that required
+    a job *dispatcher*, but a worker has no worker-function name configured —
+    correctly, since it dispatches nothing and holds no permission to invoke
+    anything. So the graph could not be satisfied and every event failed with
+    ``CHAT_WORKER_FUNCTION_NAME is not set`` before reaching any of the code
+    these tests exercise. Every other test in this file overrode the very
+    dependency that was broken.
+    """
+
+    def test_a_worker_needs_no_dispatcher_to_handle_an_event(self) -> None:
+        # No worker function name, exactly as the worker is deployed. Reaching
+        # the route at all is the assertion; a 500 here is the original bug.
+        harness = RealGraphHarness(role=ProcessRole.WORKER, table="jobs", worker="")
+
+        with harness.client() as client:
+            response = client.post(
+                "/events", json={"job_id": "j1", "request": {"message": "x"}}
+            )
+
+        assert response.status_code != 500
+        # No such job, so the claim fails and the worker acknowledges — which
+        # also proves it got as far as its own store.
+        assert response.status_code == 200
+
+    def test_a_worker_still_reports_the_asynchronous_transport(self) -> None:
+        # `async_replies_enabled` must not require a dispatcher for a worker,
+        # or the routes and the health report disagree with the deployment.
+        harness = RealGraphHarness(role=ProcessRole.WORKER, table="jobs", worker="")
+
+        with harness.client() as client:
+            assert client.get("/api/health").json()["transports"] == ["sse", "jobs"]
+
+    def test_the_api_half_does_need_a_dispatcher(self) -> None:
+        # The complement: without somewhere to send work, the serving role
+        # cannot offer the transport at all.
+        harness = RealGraphHarness(role=ProcessRole.API, table="jobs", worker="")
+
+        with harness.client() as client:
+            assert client.get("/api/health").json()["transports"] == ["sse"]
+            blocked = client.post("/api/chat/jobs", json={"message": "x"})
+            assert blocked.status_code == 404

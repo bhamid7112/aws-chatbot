@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Depends
 
-from app.application.chat_job_service import ChatJobService
+from app.application.chat_job_service import ChatJobRunner, ChatJobService
 from app.application.chat_service import ChatService
 from app.domain.ports import JobDispatcher, JobStore, ReplyGenerator
 from app.infrastructure.bedrock_reply_generator import (
@@ -154,7 +154,7 @@ def get_chat_job_service(
     dispatcher: JobDispatcherDep,
     settings: SettingsDep,
 ) -> ChatJobService:
-    """Assemble the asynchronous use case.
+    """Assemble the client's half of the asynchronous use case.
 
     Note it composes ``ChatService`` rather than a ``ReplyGenerator``: both
     transports then share one set of prompt rules, one reply source and one
@@ -167,11 +167,32 @@ def get_chat_job_service(
         dispatcher,
         deadline_seconds=settings.job_deadline_seconds,
         retention_seconds=settings.job_retention_seconds,
+        poll_interval_ms=settings.job_poll_interval_ms,
+    )
+
+
+def get_chat_job_runner(
+    chat_service: ChatServiceDep,
+    store: JobStoreDep,
+    settings: SettingsDep,
+) -> ChatJobRunner:
+    """Assemble the worker's half.
+
+    **No dispatcher, and that is the point.** A worker never hands work on, has
+    no worker function name configured, and holds no permission to invoke
+    anything — so a graph that asked for a dispatcher here could not be
+    satisfied, and the worker would fail every event before reaching its own
+    code. Asking only for what this half uses is what makes the two
+    deployments' configurations honest.
+    """
+    return ChatJobRunner(
+        chat_service,
+        store,
         flush_interval_seconds=settings.job_flush_interval_seconds,
         flush_chars=settings.job_flush_chars,
-        poll_interval_ms=settings.job_poll_interval_ms,
         max_reply_chars=settings.job_max_reply_chars,
     )
 
 
 ChatJobServiceDep = Annotated[ChatJobService, Depends(get_chat_job_service)]
+ChatJobRunnerDep = Annotated[ChatJobRunner, Depends(get_chat_job_runner)]

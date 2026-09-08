@@ -71,7 +71,14 @@ def _other_failure() -> ClientError:
 
 
 class StubDynamoDb:
-    """Records every call, and can be primed to fail or to return an item."""
+    """Records every call, and can be primed to fail or to return an item.
+
+    It also **rejects a request DynamoDB would reject**, which is the whole
+    reason it is not a bare recorder. A stub that accepts anything is a stub
+    that passes tests the service fails on first contact: an unused
+    ``ExpressionAttributeNames`` entry is a ``ValidationException`` in
+    production and was silently fine here until this check existed.
+    """
 
     def __init__(
         self,
@@ -94,6 +101,7 @@ class StubDynamoDb:
 
     def _respond(self, name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((name, kwargs))
+        _reject_unused_placeholders(kwargs)
         if self._error is not None:
             raise self._error
         return {} if self._item is None else {"Item": self._item}
@@ -101,6 +109,37 @@ class StubDynamoDb:
     @property
     def last(self) -> dict[str, Any]:
         return self.calls[-1][1]
+
+
+def _reject_unused_placeholders(kwargs: dict[str, Any]) -> None:
+    """Fail the way DynamoDB fails on a placeholder no expression mentions.
+
+    Both maps are checked, because DynamoDB rejects an unused entry in either
+    with the same class of ValidationException.
+    """
+    expressions = " ".join(
+        str(kwargs.get(key, ""))
+        for key in ("UpdateExpression", "ConditionExpression", "ProjectionExpression")
+    )
+
+    for field, placeholders in (
+        ("ExpressionAttributeNames", kwargs.get("ExpressionAttributeNames") or {}),
+        ("ExpressionAttributeValues", kwargs.get("ExpressionAttributeValues") or {}),
+    ):
+        unused = sorted(p for p in placeholders if p not in expressions)
+        if unused:
+            raise ClientError(
+                {
+                    "Error": {
+                        "Code": "ValidationException",
+                        "Message": (
+                            f"Value provided in {field} unused in expressions: "
+                            f"keys: {{{', '.join(unused)}}}"
+                        ),
+                    }
+                },
+                "UpdateItem",
+            )
 
 
 def _store(client: Any) -> DynamoDbJobStore:
@@ -146,6 +185,75 @@ class TestReservedWord:
         names = client.last["ExpressionAttributeNames"]
         assert names["#status"] == "status"
         assert "status" not in client.last["ConditionExpression"].replace("#status", "")
+
+
+class TestPlaceholdersAreDeclaredExactly:
+    """Every declared placeholder must be used, and only the used ones declared.
+
+    Found in production, not here: a single shared map of every alias was
+    passed to all five write operations, and DynamoDB rejected four of them with
+    "Value provided in ExpressionAttributeNames unused in expressions: keys:
+    {#error}". Claim, append, finish and cancel all failed; only ``fail``
+    happened to use every alias it declared. Nothing caught it because the stub
+    recorded the call instead of judging it.
+    """
+
+    @pytest.mark.parametrize(
+        "operation", ["claim", "append", "finish", "fail", "cancel"]
+    )
+    async def test_no_operation_declares_an_unused_placeholder(
+        self, operation: str
+    ) -> None:
+        # The stub raises the same ValidationException DynamoDB does, so simply
+        # completing is the assertion.
+        client = StubDynamoDb()
+        store = _store(client)
+
+        if operation == "claim":
+            await store.claim(JOB)
+        elif operation == "append":
+            await store.append(JOB, "x", expected=0)
+        elif operation == "finish":
+            await store.finish(JOB)
+        elif operation == "fail":
+            await store.fail(JOB, "why")
+        else:
+            await store.cancel(JOB)
+
+    @pytest.mark.parametrize("operation", ["claim", "append", "finish", "cancel"])
+    async def test_only_fail_declares_the_error_alias(self, operation: str) -> None:
+        # Because only `fail` writes that attribute. This is the specific
+        # mistake that broke the deployment.
+        client = StubDynamoDb()
+        store = _store(client)
+
+        if operation == "claim":
+            await store.claim(JOB)
+        elif operation == "append":
+            await store.append(JOB, "x", expected=0)
+        elif operation == "finish":
+            await store.finish(JOB)
+        else:
+            await store.cancel(JOB)
+
+        assert "#error" not in client.last["ExpressionAttributeNames"]
+
+    async def test_the_stub_would_have_caught_it(self) -> None:
+        # Guards the guard: if this stops raising, the check above proves
+        # nothing and the next unused alias reaches production.
+        with pytest.raises(ClientError) as raised:
+            _reject_unused_placeholders(
+                {
+                    "UpdateExpression": "SET #status = :s",
+                    "ExpressionAttributeNames": {
+                        "#status": "status",
+                        "#error": "error",
+                    },
+                    "ExpressionAttributeValues": {":s": {"S": "done"}},
+                }
+            )
+
+        assert "unused in expressions" in str(raised.value)
 
 
 class TestCreate:

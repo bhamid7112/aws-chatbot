@@ -82,12 +82,17 @@ _TOO_LONG_MESSAGE = "The reply grew too long to store."
 
 
 class ChatJobService:
-    """Submits, reads, cancels and runs asynchronous replies.
+    """Submits, reads and cancels asynchronous replies. The client's half.
 
-    Four methods for four callers, split by who invokes them rather than by
-    what they touch: ``submit``, ``read`` and ``cancel`` serve a client;
-    ``run`` serves whatever picked the job up. They share a store and a clock
-    and otherwise know nothing about each other.
+    Three methods for one caller: a browser. It never generates a reply, so it
+    holds no reply generator beyond the prompt rules it validates against, and
+    it never runs a job.
+
+    Split from :class:`ChatJobRunner` because the two halves need almost
+    disjoint collaborators, and a class that demanded both made the worker
+    depend on a dispatcher it would never call (ISP). That was not theoretical:
+    the worker has no dispatcher configured, and no permission to invoke
+    anything, so requiring one stopped it from starting at all.
 
     Every collaborator arrives as a port (DIP). The clock and id generator are
     injected for the same reason — a test that cannot control time cannot test
@@ -104,18 +109,8 @@ class ChatJobService:
         new_job_id: Callable[[], str] = lambda: uuid.uuid4().hex,
         deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
         retention_seconds: int = DEFAULT_RETENTION_SECONDS,
-        flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS,
-        flush_chars: int = DEFAULT_FLUSH_CHARS,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
-        max_reply_chars: int = DEFAULT_MAX_REPLY_CHARS,
     ) -> None:
-        if flush_chars < 1:
-            raise ValueError("flush_chars must be at least 1")
-        if flush_interval_seconds <= 0:
-            raise ValueError("flush_interval_seconds must be positive")
-        if max_reply_chars < 1:
-            raise ValueError("max_reply_chars must be at least 1")
-
         self._chat_service = chat_service
         self._store = store
         self._dispatcher = dispatcher
@@ -123,12 +118,7 @@ class ChatJobService:
         self._new_job_id = new_job_id
         self._deadline_seconds = deadline_seconds
         self._retention_seconds = retention_seconds
-        self._flush_interval_seconds = flush_interval_seconds
-        self._flush_chars = flush_chars
         self._poll_interval_ms = poll_interval_ms
-        self._max_reply_chars = max_reply_chars
-
-    # ---------------------------------------------------------------- client
 
     async def submit(self, request: ChatRequest) -> str:
         """Record a job, hand it off, and return its id.
@@ -161,7 +151,7 @@ class ChatJobService:
             # rather than leaving a client to wait out the deadline for news
             # we have in hand. The record stays, accurate, until it expires.
             logger.warning("job %s could not be dispatched", job_id)
-            await self._fail_quietly(job_id, _DISPATCH_FAILURE_MESSAGE)
+            await _fail_quietly(self._store, job_id, _DISPATCH_FAILURE_MESSAGE)
             raise
 
         logger.info("job %s submitted", job_id)
@@ -182,7 +172,7 @@ class ChatJobService:
         # can be stale harmlessly — see the cursor arithmetic below.
         job = await self._store.read(job_id, consistent=cursor == 0)
 
-        status, error = self._resolve(job)
+        status, error = _resolve(job, self._clock())
         return ReplyProgress(
             status=status,
             chunks=tuple(ReplyChunk(text=text) for text in job.segments[cursor:]),
@@ -204,7 +194,40 @@ class ChatJobService:
         await self._store.cancel(job_id)
         logger.info("job %s cancellation requested", job_id)
 
-    # ---------------------------------------------------------------- worker
+
+class ChatJobRunner:
+    """Generates a reply for one job and writes it out as it arrives.
+
+    The worker's half, and the counterpart of :class:`ChatJobService`. It
+    reads nothing and dispatches nothing: every step it takes is a conditional
+    write, and each one learns what it needs from whether the condition held.
+    That is why the worker's execution role can be write-only on the table and
+    hold no permission to invoke anything.
+    """
+
+    def __init__(
+        self,
+        chat_service: ChatService,
+        store: JobStore,
+        *,
+        clock: Callable[[], float] = time,
+        flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS,
+        flush_chars: int = DEFAULT_FLUSH_CHARS,
+        max_reply_chars: int = DEFAULT_MAX_REPLY_CHARS,
+    ) -> None:
+        if flush_chars < 1:
+            raise ValueError("flush_chars must be at least 1")
+        if flush_interval_seconds <= 0:
+            raise ValueError("flush_interval_seconds must be positive")
+        if max_reply_chars < 1:
+            raise ValueError("max_reply_chars must be at least 1")
+
+        self._chat_service = chat_service
+        self._store = store
+        self._clock = clock
+        self._flush_interval_seconds = flush_interval_seconds
+        self._flush_chars = flush_chars
+        self._max_reply_chars = max_reply_chars
 
     async def run(self, job_id: str, request: ChatRequest) -> None:
         """Generate the reply for ``job_id``, writing it out as it arrives.
@@ -227,12 +250,12 @@ class ChatJobService:
             # A reply that could not be produced is not a defect in this
             # process — the same distinction the synchronous path draws.
             logger.info("job %s failed: %s", job_id, exc)
-            await self._fail_quietly(job_id, str(exc))
+            await _fail_quietly(self._store, job_id, str(exc))
         except Exception:
             # A defect. Record it so nobody waits out a deadline for news we
             # already have, then re-raise so it is reported and alerted on.
             logger.exception("job %s failed unexpectedly", job_id)
-            await self._fail_quietly(job_id, _UNEXPECTED_FAILURE_MESSAGE)
+            await _fail_quietly(self._store, job_id, _UNEXPECTED_FAILURE_MESSAGE)
             raise
 
     async def _generate(self, job_id: str, request: ChatRequest) -> None:
@@ -302,26 +325,32 @@ class ChatJobService:
 
         return True
 
-    def _resolve(self, job: ChatJob) -> tuple[JobStatus, str | None]:
-        """Report a job past its deadline as failed, **without writing.**
 
-        A worker killed outright cannot record its own death, so somebody has
-        to notice. Doing it on read costs nothing, needs no scheduled sweep,
-        and keeps the read path free of writes; the record itself is left
-        alone and expires on its own.
-        """
-        if job.status.is_terminal:
-            return job.status, job.error
+def _resolve(job: ChatJob, now: float) -> tuple[JobStatus, str | None]:
+    """Report a job past its deadline as failed, **without writing.**
 
-        if self._clock() > job.deadline_at:
-            logger.warning("job %s passed its deadline with no result", job.job_id)
-            return JobStatus.FAILED, _ABANDONED_MESSAGE
+    A worker killed outright cannot record its own death, so somebody has to
+    notice. Doing it on read costs nothing, needs no scheduled sweep, and keeps
+    the read path free of writes; the record itself is left alone and expires
+    on its own.
+    """
+    if job.status.is_terminal:
+        return job.status, job.error
 
-        return job.status, None
+    if now > job.deadline_at:
+        logger.warning("job %s passed its deadline with no result", job.job_id)
+        return JobStatus.FAILED, _ABANDONED_MESSAGE
 
-    async def _fail_quietly(self, job_id: str, reason: str) -> None:
-        """Record a failure without letting that attempt mask the real one."""
-        try:
-            await self._store.fail(job_id, reason)
-        except ChatError:
-            logger.exception("could not record the failure of job %s", job_id)
+    return job.status, None
+
+
+async def _fail_quietly(store: JobStore, job_id: str, reason: str) -> None:
+    """Record a failure without letting that attempt mask the real one.
+
+    A module function because both halves need it: the client's half when a
+    hand-off is refused, the worker's when a reply cannot be produced.
+    """
+    try:
+        await store.fail(job_id, reason)
+    except ChatError:
+        logger.exception("could not record the failure of job %s", job_id)

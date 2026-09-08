@@ -60,7 +60,15 @@ _UNREACHABLE_MESSAGE = "The job store could not be reached."
 _KEY = "job_id"
 _STATUS = "#status"
 _ERROR = "#error"
-_NAMES = {_STATUS: "status", _ERROR: "error"}
+
+# Each operation declares exactly the aliases its own expressions mention, and
+# no more. That is a requirement, not tidiness: DynamoDB rejects a request whose
+# ExpressionAttributeNames contains an entry no expression uses, with
+# "Value provided in ExpressionAttributeNames unused in expressions". A single
+# shared map of every alias is therefore invalid for every operation that does
+# not happen to use all of them.
+_STATUS_ONLY = {_STATUS: "status"}
+_STATUS_AND_ERROR = {_STATUS: "status", _ERROR: "error"}
 
 _T = TypeVar("_T")
 
@@ -158,7 +166,7 @@ class DynamoDbJobStore:
             Key={_KEY: {"S": job_id}},
             UpdateExpression=f"SET {_STATUS} = :running",
             ConditionExpression=f"{_STATUS} = :pending",
-            ExpressionAttributeNames=_NAMES,
+            ExpressionAttributeNames=_STATUS_ONLY,
             ExpressionAttributeValues={
                 ":running": {"S": JobStatus.RUNNING.value},
                 ":pending": {"S": JobStatus.PENDING.value},
@@ -188,7 +196,7 @@ class DynamoDbJobStore:
             ConditionExpression=(
                 f"{_STATUS} = :running AND size(segments) = :expected"
             ),
-            ExpressionAttributeNames=_NAMES,
+            ExpressionAttributeNames=_STATUS_ONLY,
             ExpressionAttributeValues={
                 ":chunk": {"L": [{"S": text}]},
                 ":running": {"S": JobStatus.RUNNING.value},
@@ -220,6 +228,7 @@ class DynamoDbJobStore:
             job_id,
             "SET " + _STATUS + " = :terminal",
             {":terminal": {"S": JobStatus.DONE.value}},
+            _STATUS_ONLY,
             "finish",
         )
 
@@ -237,6 +246,9 @@ class DynamoDbJobStore:
                 ":terminal": {"S": JobStatus.FAILED.value},
                 ":reason": {"S": reason},
             },
+            # The one operation that writes the error attribute, and so the one
+            # that may declare its alias.
+            _STATUS_AND_ERROR,
             "fail",
         )
 
@@ -251,6 +263,7 @@ class DynamoDbJobStore:
             job_id,
             "SET " + _STATUS + " = :terminal",
             {":terminal": {"S": JobStatus.CANCELLED.value}},
+            _STATUS_ONLY,
             "cancel",
         )
 
@@ -280,6 +293,7 @@ class DynamoDbJobStore:
         job_id: str,
         update: str,
         values: dict[str, Any],
+        names: dict[str, str],
         what: str,
     ) -> None:
         """Apply a terminal transition, treating "too late" as success.
@@ -288,6 +302,11 @@ class DynamoDbJobStore:
         terminal, the caller's intent has been satisfied by whoever got there
         first, and reporting that as an error would only invite a caller to
         retry something that can never succeed.
+
+        ``names`` is a parameter rather than a constant because the caller's
+        update decides it: only ``fail`` writes the error attribute, so only
+        ``fail`` may declare that alias. Passing every alias here fails the
+        request outright.
         """
         call = partial(
             self._client.update_item,
@@ -295,7 +314,7 @@ class DynamoDbJobStore:
             Key={_KEY: {"S": job_id}},
             UpdateExpression=update,
             ConditionExpression=f"{_STATUS} IN (:pending, :running)",
-            ExpressionAttributeNames=_NAMES,
+            ExpressionAttributeNames=names,
             ExpressionAttributeValues={
                 **values,
                 ":pending": {"S": JobStatus.PENDING.value},
