@@ -7,6 +7,14 @@ One of two deployment targets — see [../README.md](../README.md) for how this 
 compares with [../serverless](../serverless), and for the shared variables both
 stacks read from `../shared.tfvars`.
 
+**This target serves the streamed transport only**, and that needs no
+configuration: there is no job store here, so `/api/health` reports
+`transports: ["sse"]`, the job routes are not mounted, and the frontend — the
+same bundle, unchanged — reads that and uses Server-Sent Events. The serverless
+target additionally offers a polled transport and prefers it; nothing about that
+reaches this stack. If you are wondering why a chat here streams while the same
+bundle polls on CloudFront, that is why.
+
 | File | Holds |
 | --- | --- |
 | `versions.tf` | Terraform and provider constraints; why state is local |

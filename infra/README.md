@@ -29,12 +29,16 @@ Both run the identical application. The differences are operational.
 | Release | `git push` + one SSM command | `release-api.sh` / `release-web.sh` |
 | Build runs on | the instance | your workstation (Docker + buildx) |
 | Prerequisites | Terraform, AWS CLI | Terraform, AWS CLI, git, **Docker with buildx** |
-| Debugging | SSM session, `docker compose logs` | `aws logs tail` — no host, no shell |
-| What is deployed | `git log -1` on the box | an image digest |
-| Resources | 17 | 20 |
+| Debugging | SSM session, `docker compose logs` | `aws logs tail` across two log groups — no host, no shell |
+| What is deployed | `git log -1` on the box | an image digest, and **both functions must match** |
+| Resources | 17 | 43 (42 without `alert_email`) |
 | Apply time | ~2 min (+5–10 min first boot) | 3–8 min |
 | Destroy time | ~2 min | 15+ min (CloudFront) |
-| Idle risk | an unattached Elastic IP bills hourly | an abandoned stream bills to timeout |
+| Transports | streamed only | streamed **and** polled; polled is the default |
+| A reply survives a dropped connection | no | yes, on the polled transport |
+| Stopping a reply stops the billed work | no | yes, on the polled transport |
+| Conversation content at rest | none | replies in DynamoDB, 1 h TTL |
+| Idle risk | an unattached Elastic IP bills hourly | an abandoned **streamed** reply bills to timeout; a polled one is cancelled |
 
 Rules of thumb:
 

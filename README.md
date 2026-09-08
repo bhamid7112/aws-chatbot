@@ -1,18 +1,35 @@
 # AWS Chatbot
 
-A streaming chat application — React front end, FastAPI back end, Server-Sent
-Events between them — deployable to AWS **two ways, from one codebase**:
+A streaming chat application — React front end, FastAPI back end — deployable to
+AWS **two ways, from one codebase**:
 
 - **Server** — a single EC2 instance behind Caddy, reachable over genuine HTTPS
   **on a bare IP address with no domain name involved**.
-- **Serverless** — CloudFront and S3 in front of a Lambda function, streaming SSE
-  end to end.
+- **Serverless** — CloudFront and S3 in front of Lambda, with a second function
+  generating replies in the background.
 
 Both run the *same* image and the same `uvicorn app.main:app` process. There is no
 handler, no Mangum and no ASGI shim anywhere in `backend/`: the serverless target
 cost **zero** lines of application code, and the frontend's only concession is one
 request header. Choosing between them is
 [a table in infra/README.md](infra/README.md#choosing-a-target).
+
+There are also **two transports** for getting a reply to the browser, chosen at
+runtime from what the backend says it can serve:
+
+| | Streamed | Polled |
+| --- | --- | --- |
+| Route | `POST /api/chat`, Server-Sent Events | `POST /api/chat/jobs`, then read by cursor |
+| Available on | both targets | serverless only |
+| Reply survives a dropped connection | no | **yes** |
+| Bounded by the CDN's 60 s origin read timeout | yes | no |
+| Stopping it stops the billed work | **no** | yes |
+
+The polled transport is the default where it exists; the streamed one is retained
+as the fallback and reachable with `?transport=sse`. Neither `useChat` nor any
+component knows which is in use — both satisfy the same one-method `ChatGateway`
+port, which is the concrete payoff of the layering below. See
+[infra/serverless/README.md](infra/serverless/README.md#asynchronous-replies).
 
 ### Server target
 
@@ -50,10 +67,17 @@ command ships a new version of it.
                                            └──────────────┬──────────────┘
                                                           ▼
                                            ┌─────────────────────────────┐
-                                           │ Lambda (container image)    │
+                                           │ api Lambda (container image)│
                                            │  lambda-adapter extension   │
-                                           │  └─► uvicorn + FastAPI, SSE │
-                                           └─────────────────────────────┘
+                                           │  └─► uvicorn + FastAPI      │
+                                           └────┬───────────────────┬────┘
+                                    streamed    │                   │  polled
+                                                ▼                   ▼
+                                            Bedrock          worker Lambda ─► DynamoDB
+                                                             (same image)     jobs, TTL 1 h
+                                                                  │
+                                                                  ▼
+                                                             Bedrock
 ```
 
 CloudFront is the only way in here too, by the same principle: S3 blocks all
@@ -79,7 +103,8 @@ signing is the only thing either origin accepts.
 | Styling | Hand-written CSS with design tokens (`src/styles/tokens.css`) | Two files of tokens and one stylesheet per component. Nothing to compile, nothing to purge. |
 | Back end | FastAPI on uvicorn, Python 3.12 | Native async streaming responses, which is the one thing this API does; OpenAPI comes free at `/api/docs`. |
 | Validation | Pydantic v2, at the HTTP boundary only | DTOs validate *shape*. Business rules live in the use case, so no rule has two homes. |
-| Transport | Server-Sent Events over `POST /api/chat` | Text flowing one way, framed, resumable to read with plain `fetch`. WebSockets would add a bidirectional protocol for a unidirectional problem. |
+| Transport | Server-Sent Events over `POST /api/chat`, plus job polling where available | Text flowing one way, framed, resumable to read with plain `fetch`. WebSockets would add a bidirectional protocol for a unidirectional problem. Polling is the durable alternative, and it needs no second protocol either: the cursor lives in the URL, so resuming is free. |
+| Job store (serverless) | DynamoDB, one item per reply, TTL 1 h | The reply is an append-only list of segments whose *length is the cursor*, so no counter can drift from it. Conditional writes make cancellation and retry-idempotency the same mechanism. |
 | Python tooling | **uv** (`uv.lock` committed), ruff, mypy `strict` | Lockfile-exact installs in every environment, including inside the image (`uv sync --locked`). |
 | Containers | Docker + Compose, multi-stage builds | Two images: `api` (Python) and `web` (Caddy with the compiled bundle baked in). |
 | Edge | Caddy 2.11 | Automatic HTTPS with ACME built in — and, critically, it can obtain a certificate for an IP address. |
@@ -115,6 +140,37 @@ the use case knows which of the two it is talking to: see
    as SSE and flushed.
 6. The gateway reassembles frames, yields chunks, and the hook appends them to
    the in-flight assistant message. The bubble grows as the words arrive.
+
+That is the streamed path, and it is the only one that exists locally and on the
+server target.
+
+### The same request, polled
+
+On the serverless target steps 2–6 are replaced, and **steps 1 and 6 are
+untouched** — which is the point of the port:
+
+1. `JobsChatGateway` posts the same `{message, history}` to `/api/chat/jobs`. The
+   API validates the prompt with the same `ChatService.validate`, writes a
+   `pending` job, hands it to a second Lambda with
+   `InvocationType="Event"`, and answers **202** with a job id.
+2. The worker claims the job with a conditional write, consumes the *same*
+   `ChatService.stream_reply`, and appends the reply to the job item in batches —
+   every 400 ms or 120 characters, whichever comes first. Never per token: a store
+   bills for the whole item on every write, so appending N times to a growing
+   list costs O(N²).
+3. The gateway polls `GET /api/chat/jobs/{id}/segments/{cursor}` and yields each
+   new segment as a chunk. The cursor is the number of segments already seen, so
+   resuming after any interruption is just asking again.
+4. The hook appends the chunks exactly as before, and never learns which
+   transport produced them.
+
+Because both transports go through `ChatService`, there is **one** set of prompt
+rules, one reply generator and one error translation. The only thing that can
+differ between them is how the answer reaches the browser.
+
+Two consequences worth expecting rather than debugging: the wire readout counts
+*segments*, not tokens, so it climbs in steps; and words appear in groups bounded
+by the flush interval plus the poll interval rather than arriving individually.
 
 ### The wire format
 
@@ -166,7 +222,7 @@ gate**, not a convention:
 | --- | --- | --- |
 | **domain** | `entities.py`, `ports.py`, `errors.py` — pure Python, no framework | `message.ts`, `chatGateway.ts`, `errors.ts` — no imports at all |
 | **application** | `chat_service.py` — the use case; no FastAPI, no Pydantic, no SSE | `useChat.ts` — the use case as a hook; React is the one allowed import |
-| **infrastructure** | `bedrock_reply_generator.py`, `canned_reply_generator.py`, `config.py` | `sseChatGateway.ts` — the only file that knows the reply arrives over HTTP |
+| **infrastructure** | `bedrock_reply_generator.py`, `canned_reply_generator.py`, `dynamodb_job_store.py`, `lambda_job_dispatcher.py`, `config.py` | `sseChatGateway.ts`, `jobsChatGateway.ts`, `transportSelectingChatGateway.ts`, `chatHttp.ts` — the only files that know the reply arrives over HTTP |
 | **interfaces / presentation** | `routes.py`, `schemas.py`, `sse.py`, `dependencies.py` | `ChatWindow`, `ChatInput`, `MessageBubble`, … |
 | **main** | `main.py` — assembles, then gets out of the way | `main.tsx` — the only file naming a concrete gateway |
 
@@ -590,6 +646,13 @@ that ships the runtime interface client — starts the image's own
 `uvicorn app.main:app` and turns each invocation into an HTTP request against it.
 So `backend/` gains no handler, no dependency and no branch on "am I on Lambda".
 
+This target runs **two functions from one image**, differing only in their
+environment: the `api` function serves HTTP, and the `worker` function generates
+asynchronous replies. The worker needs no separate handler either — the adapter's
+*pass-through* feature turns a non-HTTP invocation into a POST against `/events`,
+so a background worker is just another route. That plus a DynamoDB job table and
+an SQS failure queue is the whole of the polled transport.
+
 ### Prerequisites
 
 - Terraform ≥ 1.9, AWS CLI v2, git, and **Docker with buildx** on `PATH`, with a
@@ -651,9 +714,16 @@ bash ./scripts/release-web.sh                    # frontend
 terraform -chdir=infra/serverless apply -var-file=../shared.tfvars   # config/infrastructure
 ```
 
-`release-api.sh` pushes under the commit SHA, updates the function by **digest**,
-and waits for `Active` — a container-image update goes `Pending` while Lambda
-re-optimises the image and rejects invocations until it finishes.
+`release-api.sh` pushes under the commit SHA, updates **both functions** by
+**digest**, and waits for each to become `Active` — a container-image update goes
+`Pending` while Lambda re-optimises the image and rejects invocations until it
+finishes.
+
+Because those two updates are not atomic, a new api can briefly talk to an old
+worker. **The invoke payload and the job item schema are therefore
+additive-only:** never rename a field, never add a required one. A rename means
+the api writes one attribute name while the old worker writes another, and every
+job hangs with no error anywhere.
 
 `release-web.sh` uploads assets first with a one-year immutable cache and
 `index.html` last with `no-cache`, so the shell is never newer than the chunks it
@@ -663,13 +733,19 @@ must survive for tabs still open on the old bundle.
 ### Observability
 
 ```powershell
-terraform -chdir=infra/serverless output -raw api_log_command        # aws logs tail --follow
-terraform -chdir=infra/serverless output -raw deployed_image_command # what is actually running
+terraform -chdir=infra/serverless output -raw api_log_command         # aws logs tail --follow
+terraform -chdir=infra/serverless output -raw worker_log_command      # the polled transport
+terraform -chdir=infra/serverless output -raw deployed_image_command  # what is actually running
 ```
 
 There is no host to inspect and no `git log` to run — the deployed revision is an
-image digest. Better in steady state, worse the first time init fails and there
-is no shell to get a stack trace from.
+image digest, and `deployed_image_command` prints one per function. **Both must
+match**; a worker left behind on an older digest is the worst failure class here,
+because the api half looks perfectly healthy.
+
+A single job's story spans both log groups: the api logs `submitted` and
+`cancellation requested`, the worker logs `claimed` and then one of `done`,
+`failed`, `is cancelled; stopping` or `was not claimable`.
 
 ### Teardown
 
@@ -690,12 +766,26 @@ Unlike the server target there is **no standing cost to leaving this deployed**.
   6399 ms of billed duration for 46 ms of work. Container images cannot use
   SnapStart, and provisioned concurrency would erase the cost advantage.
 - **Lambda bills the full duration and does not stop a stream when the viewer
-  disconnects.** Abandoned chats are routine, and each bills to completion or
-  timeout. `timeout_seconds` and `bedrock_max_output_tokens` are the bounds. The
-  server target has no equivalent exposure.
-- **A release is not atomic.** Bundle upload, cache invalidation and the function
-  update are three independently-timed steps, so a frontend expecting a new API
-  contract needs the API released first.
+  disconnects** — on the **streamed** transport. Abandoned chats are routine and
+  each bills to completion or timeout; `timeout_seconds` and
+  `bedrock_max_output_tokens` are the bounds. The server target has no equivalent
+  exposure. The polled transport exists largely to fix this: cancelling stops the
+  work within one flush interval, measured at 270 ms, and the browser cancels on
+  tab close as well as on Stop.
+- **The polled transport is not a latency win.** About 150 ms slower to first
+  token when warm, and about 2.5 s on a session's first message while the worker
+  cold-starts. It buys durability, cancellation and freedom from the 60 s origin
+  read timeout — not speed.
+- **A release is not atomic**, in two ways. Bundle upload, cache invalidation and
+  the function update are three independently-timed steps, so a frontend
+  expecting a new API contract needs the API released first; and the two
+  functions are updated in sequence, which is why the job schema is
+  additive-only.
+- **Replies come to rest.** The job table holds conversation content under an
+  AWS-owned key with a one-hour TTL — though DynamoDB deletes expired items only
+  *typically within 48 hours* — and a failure record carries the original prompt.
+  Prompts are never written to the table itself. See
+  [Data at rest](infra/serverless/README.md#data-at-rest).
 - **No VPC, deliberately.** The function calls only public AWS endpoints, so
   there is no NAT gateway to pay for — and a VPC would break Function URL
   response streaming outright.
