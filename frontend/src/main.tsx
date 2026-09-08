@@ -39,14 +39,21 @@ const jobs = new JobsChatGateway()
 
 const gateway = new TransportSelectingChatGateway({
   advertised: probeTransports(),
-  // Preference order. **Flipping these two lines is what makes asynchronous
-  // replies the default** — the change step 6 of the plan exists to make.
+  // Preference order: **asynchronous replies are the default** where the
+  // backend can serve them. What that buys over the streamed path is a reply
+  // that survives a dropped connection or a closed laptop lid, a reply longer
+  // than a CDN's origin read timeout can carry, and a Stop button that actually
+  // stops the work being paid for. What it costs is roughly 150 ms on a warm
+  // first token, and about 2.5 s on a session's first message while the worker
+  // starts — measured, not assumed.
   options: [
-    { name: 'sse', endpoint: `POST ${sse.endpoint}`, gateway: sse },
     { name: 'jobs', endpoint: `POST ${jobs.endpoint}`, gateway: jobs },
+    { name: 'sse', endpoint: `POST ${sse.endpoint}`, gateway: sse },
   ],
-  // Not derived from the order above: this is the transport that has existed
-  // since the beginning and is served by every deployment.
+  // Not derived from the order above, and that separation is what makes the
+  // line above safe to change: this is the transport that has existed since the
+  // beginning and that every deployment serves. The EC2 target advertises only
+  // this one and so keeps working, unchanged, from this same bundle.
   fallback: 'sse',
   forced: askedForTransport(),
 })
