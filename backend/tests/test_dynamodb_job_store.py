@@ -11,6 +11,7 @@ adapter that forgot to ask.
 
 from __future__ import annotations
 
+import re
 from typing import Any, cast
 
 import pytest
@@ -75,9 +76,10 @@ class StubDynamoDb:
 
     It also **rejects a request DynamoDB would reject**, which is the whole
     reason it is not a bare recorder. A stub that accepts anything is a stub
-    that passes tests the service fails on first contact: an unused
-    ``ExpressionAttributeNames`` entry is a ``ValidationException`` in
-    production and was silently fine here until this check existed.
+    that passes tests the service fails on first contact — and this one has now
+    been taught the two mistakes that actually shipped, one in each direction:
+    an ``ExpressionAttributeNames`` entry no expression uses, and an attribute
+    name an expression uses without an alias.
     """
 
     def __init__(
@@ -102,6 +104,7 @@ class StubDynamoDb:
     def _respond(self, name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((name, kwargs))
         _reject_unused_placeholders(kwargs)
+        _reject_unaliased_names(kwargs)
         if self._error is not None:
             raise self._error
         return {} if self._item is None else {"Item": self._item}
@@ -138,6 +141,74 @@ def _reject_unused_placeholders(kwargs: dict[str, Any]) -> None:
                         ),
                     }
                 },
+                "UpdateItem",
+            )
+
+
+#: Everything an expression may legitimately contain that is not an attribute
+#: name: the clause keywords, the operators and the built-in functions.
+_EXPRESSION_WORDS = frozenset(
+    {
+        "set",
+        "remove",
+        "add",
+        "delete",
+        "and",
+        "or",
+        "not",
+        "in",
+        "between",
+        "attribute_exists",
+        "attribute_not_exists",
+        "attribute_type",
+        "begins_with",
+        "contains",
+        "size",
+        "if_not_exists",
+        "list_append",
+    }
+)
+
+#: A bare word, skipping anything introduced by ``#`` or ``:`` — that is, every
+#: token in an expression that is neither an alias nor a value placeholder.
+_BARE_WORD = re.compile(r"(?<![#:\w])[A-Za-z_]\w*")
+
+
+def _reject_unaliased_names(kwargs: dict[str, Any]) -> None:
+    """Fail on an attribute name written into an expression directly.
+
+    The complement of the check above, and it exists for the second bug to
+    reach production: ``SEGMENTS`` is a DynamoDB reserved word, so
+    ``SET segments = list_append(segments, :chunk)`` is rejected with
+    "Attribute name is a reserved keyword" while ``#segments`` is accepted. The
+    adapter aliased ``status`` in four places and then named ``segments``
+    directly in the one expression that mentions it, so ``append`` — and only
+    ``append`` — failed, which is enough to stop every reply.
+
+    Deliberately **stricter than DynamoDB**, which objects only to the several
+    hundred names on its reserved list. Requiring every name to be aliased
+    needs no copy of that list, cannot fall behind it as the list grows, and
+    costs one map entry per attribute. ``Key`` and ``Item`` maps are untouched:
+    they are not expressions and take real names.
+    """
+    for key in ("UpdateExpression", "ConditionExpression", "ProjectionExpression"):
+        expression = str(kwargs.get(key, ""))
+        for word in _BARE_WORD.findall(expression):
+            if word.lower() in _EXPRESSION_WORDS:
+                continue
+            raise ClientError(
+                cast(
+                    "Any",
+                    {
+                        "Error": {
+                            "Code": "ValidationException",
+                            "Message": (
+                                f"Invalid {key}: attribute name is not aliased "
+                                f"and may be a reserved keyword; name: {word}"
+                            ),
+                        }
+                    },
+                ),
                 "UpdateItem",
             )
 
@@ -256,6 +327,79 @@ class TestPlaceholdersAreDeclaredExactly:
         assert "unused in expressions" in str(raised.value)
 
 
+class TestNamesAreAlwaysAliased:
+    """No expression may name an attribute directly.
+
+    The other half of the same lesson, and the second defect to reach a live
+    deployment. ``SEGMENTS`` is a DynamoDB reserved word exactly as ``STATUS``
+    is, so ``SET segments = list_append(segments, :chunk)`` was rejected with
+    "Attribute name is a reserved keyword; reserved keyword: segments". Only
+    ``append`` mentions that attribute, so the worker claimed its job, had its
+    first flush refused, and reported a store failure — no reply, on every job.
+
+    Checking names against the reserved list would be a losing game; the rule
+    asserted here is that there is nothing to check, because every name in
+    every expression is an alias.
+    """
+
+    @pytest.mark.parametrize(
+        "operation", ["create", "claim", "append", "finish", "fail", "cancel"]
+    )
+    async def test_no_operation_names_an_attribute_directly(
+        self, operation: str
+    ) -> None:
+        # The stub rejects a bare name, so completing is the assertion.
+        client = StubDynamoDb()
+        store = _store(client)
+
+        if operation == "create":
+            await store.create(JOB, created_at=1, deadline_at=2, expires_at=3)
+        elif operation == "claim":
+            await store.claim(JOB)
+        elif operation == "append":
+            await store.append(JOB, "x", expected=0)
+        elif operation == "finish":
+            await store.finish(JOB)
+        elif operation == "fail":
+            await store.fail(JOB, "why")
+        else:
+            await store.cancel(JOB)
+
+    async def test_append_aliases_the_reserved_word_it_needs(self) -> None:
+        # Named rather than left to the sweep above, because this is the exact
+        # expression that failed and the alias is easy to lose in a refactor.
+        client = StubDynamoDb()
+
+        await _store(client).append(JOB, "hello", expected=0)
+
+        call = client.last
+        assert call["ExpressionAttributeNames"]["#segments"] == "segments"
+        assert "#segments" in call["UpdateExpression"]
+        assert "#segments" in call["ConditionExpression"]
+
+    async def test_the_stub_would_have_caught_it(self) -> None:
+        # Guards the guard, with the literal expression that shipped.
+        with pytest.raises(ClientError) as raised:
+            _reject_unaliased_names(
+                {"UpdateExpression": "SET segments = list_append(segments, :chunk)"}
+            )
+
+        assert "not aliased" in str(raised.value)
+        assert "segments" in str(raised.value)
+
+    async def test_the_stub_accepts_a_fully_aliased_expression(self) -> None:
+        # The complement: a guard that rejected everything would pass the test
+        # above while making the suite meaningless.
+        _reject_unaliased_names(
+            {
+                "UpdateExpression": "SET #segments = list_append(#segments, :chunk)",
+                "ConditionExpression": (
+                    "#status = :running AND size(#segments) = :expected"
+                ),
+            }
+        )
+
+
 class TestCreate:
     async def test_writes_a_pending_job_with_an_empty_reply(self) -> None:
         # The empty list is not decoration: list_append against a missing
@@ -275,7 +419,7 @@ class TestCreate:
 
         await _store(client).create(JOB, created_at=1, deadline_at=2, expires_at=3)
 
-        assert "attribute_not_exists(job_id)" in client.last["ConditionExpression"]
+        assert "attribute_not_exists(#job_id)" in client.last["ConditionExpression"]
 
     async def test_a_collision_is_reported(self) -> None:
         client = StubDynamoDb(error=_conditional_failure())
@@ -306,7 +450,7 @@ class TestAppend:
         await _store(client).append(JOB, "hello", expected=3)
 
         condition = client.last["ConditionExpression"]
-        assert "size(segments) = :expected" in condition
+        assert "size(#segments) = :expected" in condition
         assert "#status = :running" in condition
         assert client.last["ExpressionAttributeValues"][":expected"] == {"N": "3"}
 

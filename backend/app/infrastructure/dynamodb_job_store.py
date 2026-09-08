@@ -18,8 +18,12 @@ are consequences of the SDK rather than of DynamoDB:
   re-sent append learns it already landed. Callers get an outcome; nobody sees a
   ``ConditionalCheckFailedException``.
 
-The attribute is ``#status`` everywhere, never ``status``: ``STATUS`` is a
-DynamoDB reserved word, and using it unaliased fails the request outright.
+**Every attribute name inside an expression is an alias, without exception.**
+Not a style preference: ``STATUS``, ``SEGMENTS`` and ``ERROR`` are all DynamoDB
+reserved words, and naming one directly in an expression fails the request
+outright. Checking each name against the reserved list is a losing game — the
+list holds several hundred words and grows — so the rule here is structural,
+and the test double enforces it.
 """
 
 from __future__ import annotations
@@ -57,17 +61,28 @@ DEFAULT_MAX_ATTEMPTS = 4
 _CONDITIONAL_CHECK_FAILED = "ConditionalCheckFailedException"
 _UNREACHABLE_MESSAGE = "The job store could not be reached."
 
+#: The raw attribute name, for ``Key`` and ``Item`` maps — which are not
+#: expressions, and so take real names rather than aliases.
 _KEY = "job_id"
+
+_JOB_ID = "#job_id"
 _STATUS = "#status"
+_SEGMENTS = "#segments"
 _ERROR = "#error"
 
 # Each operation declares exactly the aliases its own expressions mention, and
-# no more. That is a requirement, not tidiness: DynamoDB rejects a request whose
-# ExpressionAttributeNames contains an entry no expression uses, with
-# "Value provided in ExpressionAttributeNames unused in expressions". A single
-# shared map of every alias is therefore invalid for every operation that does
-# not happen to use all of them.
+# no more. Both directions are enforced, and each has bitten this adapter once:
+#
+# * Declaring an alias no expression uses is rejected outright with "Value
+#   provided in ExpressionAttributeNames unused in expressions", so a single
+#   shared map of every alias is invalid for every operation that does not
+#   happen to use all of them.
+# * Using a name no alias covers risks the reserved-word list — "Attribute name
+#   is a reserved keyword" — which is why there is an alias here even for
+#   ``job_id``, a name that happens not to be reserved today.
+_JOB_ID_ONLY = {_JOB_ID: _KEY}
 _STATUS_ONLY = {_STATUS: "status"}
+_STATUS_AND_SEGMENTS = {_STATUS: "status", _SEGMENTS: "segments"}
 _STATUS_AND_ERROR = {_STATUS: "status", _ERROR: "error"}
 
 _T = TypeVar("_T")
@@ -143,7 +158,8 @@ class DynamoDbJobStore:
                 "deadline_at": {"N": str(deadline_at)},
                 "expires_at": {"N": str(expires_at)},
             },
-            ConditionExpression=f"attribute_not_exists({_KEY})",
+            ConditionExpression=f"attribute_not_exists({_JOB_ID})",
+            ExpressionAttributeNames=_JOB_ID_ONLY,
         )
         try:
             await self._run(call, "put_item")
@@ -192,11 +208,11 @@ class DynamoDbJobStore:
             self._client.update_item,
             TableName=self._table_name,
             Key={_KEY: {"S": job_id}},
-            UpdateExpression="SET segments = list_append(segments, :chunk)",
+            UpdateExpression=(f"SET {_SEGMENTS} = list_append({_SEGMENTS}, :chunk)"),
             ConditionExpression=(
-                f"{_STATUS} = :running AND size(segments) = :expected"
+                f"{_STATUS} = :running AND size({_SEGMENTS}) = :expected"
             ),
-            ExpressionAttributeNames=_STATUS_ONLY,
+            ExpressionAttributeNames=_STATUS_AND_SEGMENTS,
             ExpressionAttributeValues={
                 ":chunk": {"L": [{"S": text}]},
                 ":running": {"S": JobStatus.RUNNING.value},
