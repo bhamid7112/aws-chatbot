@@ -20,9 +20,43 @@ class InvalidPromptError(ChatError):
     """
 
 
+class RequestTooLargeError(InvalidPromptError):
+    """The request will not fit in the transport that carries it to a worker.
+
+    Deliberately an :class:`InvalidPromptError`: it is caller error with the
+    same remedy — send less — so the interface layer's existing 422 mapping
+    already handles it and needs no new branch.
+
+    The bound is an adapter's, not a domain rule's, which is why the limit
+    itself lives with the adapter that is constrained by it.
+    """
+
+
 class ReplyGenerationError(ChatError):
     """A :class:`~app.domain.ports.ReplyGenerator` could not produce a reply.
 
     The only exception type a generator is permitted to raise. See the port's
     contract for why that matters.
+    """
+
+
+class JobNotFoundError(ChatError):
+    """No such job — never created, or already expired by its TTL.
+
+    Not a failure of the job: a job that ran to completion and then aged out
+    is indistinguishable from one that never existed, and both mean the same
+    thing to a caller holding the id.
+    """
+
+
+class JobStoreError(ChatError):
+    """A :class:`~app.domain.ports.JobStore` could not be read or written."""
+
+
+class JobDispatchError(ChatError):
+    """A :class:`~app.domain.ports.JobDispatcher` could not hand off the work.
+
+    Distinct from :class:`JobStoreError` because the remedies differ: the job
+    record exists and is sound, but nothing is going to pick it up, so the
+    caller can be told immediately rather than waiting out a deadline.
     """

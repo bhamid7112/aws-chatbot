@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.domain.errors import InvalidPromptError
-from app.interfaces.dependencies import ChatServiceDep
+from app.interfaces.dependencies import ChatServiceDep, SettingsDep
 from app.interfaces.schemas import ChatRequestDTO, ErrorDTO, HealthDTO
 from app.interfaces.sse import SSE_MEDIA_TYPE, STREAM_HEADERS, event_stream
 
@@ -31,9 +31,14 @@ HTTP_UNPROCESSABLE = 422
     summary="Liveness probe",
     tags=["ops"],
 )
-async def health() -> HealthDTO:
-    """Report that the process is up. Used by the container healthcheck."""
-    return HealthDTO()
+async def health(settings: SettingsDep) -> HealthDTO:
+    """Report that the process is up, and what it can do.
+
+    Used by the container healthcheck, which reads only ``status``, and by the
+    browser, which reads ``transports`` to pick a chat transport this
+    deployment actually has.
+    """
+    return HealthDTO(transports=list(settings.transports))
 
 
 @router.post(

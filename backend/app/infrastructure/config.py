@@ -20,11 +20,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from app.application.chat_job_service import (
+    DEFAULT_DEADLINE_SECONDS,
+    DEFAULT_FLUSH_CHARS,
+    DEFAULT_FLUSH_INTERVAL_SECONDS,
+    DEFAULT_MAX_REPLY_CHARS,
+    DEFAULT_POLL_INTERVAL_MS,
+    DEFAULT_RETENTION_SECONDS,
+)
 from app.application.chat_service import DEFAULT_MAX_PROMPT_CHARS
 from app.infrastructure.bedrock_reply_generator import (
     DEFAULT_MAX_HISTORY_MESSAGES,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_MODEL_ID,
+    DEFAULT_READ_TIMEOUT_SECONDS,
     DEFAULT_REGION,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TEMPERATURE,
@@ -47,6 +56,24 @@ class ReplySource(StrEnum):
     CANNED = "canned"
 
 
+class ProcessRole(StrEnum):
+    """What this process is for.
+
+    One image is deployed twice: once to serve requests, once to generate
+    replies asynchronously. They run the same code and differ only in which
+    routes are mounted, which is what keeps them from drifting apart.
+
+    The role decides whether the worker's entrypoint exists at all. It could be
+    inferred — nothing can currently reach that route on the serving deployment
+    — but inferring it would make an application's attack surface depend on a
+    CDN path pattern and a reverse-proxy matcher staying exactly as they are.
+    Naming the role costs one variable and removes that dependency.
+    """
+
+    API = "api"
+    WORKER = "worker"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Values that vary between environments.
@@ -66,8 +93,47 @@ class Settings:
     bedrock_region: str = DEFAULT_REGION
     bedrock_max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     bedrock_temperature: float = DEFAULT_TEMPERATURE
+    bedrock_read_timeout_seconds: float = DEFAULT_READ_TIMEOUT_SECONDS
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     max_history_messages: int = DEFAULT_MAX_HISTORY_MESSAGES
+
+    role: ProcessRole = ProcessRole.API
+    #: Empty means the asynchronous path is not available in this deployment.
+    #: It is the single switch: no table, no job routes, and ``/api/health``
+    #: stops advertising the transport, so a client cannot choose one the
+    #: server cannot serve.
+    jobs_table_name: str = ""
+    worker_function_name: str = ""
+    job_deadline_seconds: int = DEFAULT_DEADLINE_SECONDS
+    job_retention_seconds: int = DEFAULT_RETENTION_SECONDS
+    job_flush_interval_seconds: float = DEFAULT_FLUSH_INTERVAL_SECONDS
+    job_flush_chars: int = DEFAULT_FLUSH_CHARS
+    job_poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS
+    job_max_reply_chars: int = DEFAULT_MAX_REPLY_CHARS
+
+    @property
+    def async_replies_enabled(self) -> bool:
+        """Whether this deployment can accept asynchronous replies.
+
+        Derived rather than configured, so there is no way to advertise the
+        transport without having somewhere to keep its state. The serving role
+        additionally needs somewhere to send the work.
+        """
+        if not self.jobs_table_name:
+            return False
+        if self.role is ProcessRole.API:
+            return bool(self.worker_function_name)
+        return True
+
+    @property
+    def transports(self) -> tuple[str, ...]:
+        """Which chat transports a client may use against this deployment.
+
+        Reported by ``/api/health`` so that one bundle can serve both
+        deployment targets: the server target has no job routes, and a client
+        that guessed otherwise would simply fail.
+        """
+        return ("sse", "jobs") if self.async_replies_enabled else ("sse",)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -88,8 +154,8 @@ class Settings:
             cors_allow_origins=_read_csv(
                 source, "CHAT_CORS_ALLOW_ORIGINS", defaults.cors_allow_origins
             ),
-            reply_source=_read_reply_source(
-                source, "CHAT_REPLY_SOURCE", defaults.reply_source
+            reply_source=_read_enum(
+                source, "CHAT_REPLY_SOURCE", defaults.reply_source, ReplySource
             ),
             bedrock_model_id=_read_str(
                 source, "CHAT_BEDROCK_MODEL_ID", defaults.bedrock_model_id
@@ -108,8 +174,40 @@ class Settings:
             # Not _read_str: an explicitly empty prompt means "send no system
             # block at all", which is a legitimate thing to want.
             system_prompt=source.get("CHAT_SYSTEM_PROMPT", defaults.system_prompt),
+            bedrock_read_timeout_seconds=_read_float(
+                source,
+                "CHAT_BEDROCK_READ_TIMEOUT_SECONDS",
+                defaults.bedrock_read_timeout_seconds,
+            ),
             max_history_messages=_read_int(
                 source, "CHAT_MAX_HISTORY_MESSAGES", defaults.max_history_messages
+            ),
+            role=_read_enum(source, "CHAT_ROLE", defaults.role, ProcessRole),
+            jobs_table_name=_read_str(
+                source, "CHAT_JOBS_TABLE", defaults.jobs_table_name
+            ),
+            worker_function_name=_read_str(
+                source, "CHAT_WORKER_FUNCTION_NAME", defaults.worker_function_name
+            ),
+            job_deadline_seconds=_read_int(
+                source, "CHAT_JOB_DEADLINE_SECONDS", defaults.job_deadline_seconds
+            ),
+            job_retention_seconds=_read_int(
+                source, "CHAT_JOB_RETENTION_SECONDS", defaults.job_retention_seconds
+            ),
+            job_flush_interval_seconds=_read_float(
+                source,
+                "CHAT_JOB_FLUSH_INTERVAL_SECONDS",
+                defaults.job_flush_interval_seconds,
+            ),
+            job_flush_chars=_read_int(
+                source, "CHAT_JOB_FLUSH_CHARS", defaults.job_flush_chars
+            ),
+            job_poll_interval_ms=_read_int(
+                source, "CHAT_JOB_POLL_INTERVAL_MS", defaults.job_poll_interval_ms
+            ),
+            job_max_reply_chars=_read_int(
+                source, "CHAT_JOB_MAX_REPLY_CHARS", defaults.job_max_reply_chars
             ),
         )
 
@@ -157,14 +255,23 @@ def _read_str(source: Mapping[str, str], key: str, fallback: str) -> str:
     return source.get(key, "").strip() or fallback
 
 
-def _read_reply_source(
-    source: Mapping[str, str], key: str, fallback: ReplySource
-) -> ReplySource:
+def _read_enum[EnumT: StrEnum](
+    source: Mapping[str, str],
+    key: str,
+    fallback: EnumT,
+    member_type: type[EnumT],
+) -> EnumT:
+    """One of an enum's members, or the fallback if unset.
+
+    An unrecognised value raises rather than falling back, and does so at
+    import time. A typo in a deployment variable should stop the process
+    outright, not silently select a behaviour nobody asked for.
+    """
     raw = source.get(key, "").strip().lower()
     if not raw:
         return fallback
     try:
-        return ReplySource(raw)
+        return member_type(raw)
     except ValueError as exc:
-        permitted = ", ".join(member.value for member in ReplySource)
+        permitted = ", ".join(member.value for member in member_type)
         raise ValueError(f"{key} must be one of {permitted}, got {raw!r}") from exc

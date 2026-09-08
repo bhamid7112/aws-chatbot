@@ -129,10 +129,18 @@ class BedrockReplyGenerator:
         """
         try:
             stream = await anyio.to_thread.run_sync(self._start_stream, request)
-            async for event in _aiterate(stream):
-                text = _delta_text(event)
-                if text:
-                    yield ReplyChunk(text=text)
+            try:
+                async for event in _aiterate(iter(stream)):
+                    text = _delta_text(event)
+                    if text:
+                        yield ReplyChunk(text=text)
+            finally:
+                # Runs when the reply completes, when it fails, and — the case
+                # this exists for — when the consumer walks away mid-stream.
+                # Abandoning the stream used to leak the socket; a cancelled
+                # asynchronous job makes that the routine path rather than a
+                # rare one.
+                _close_quietly(stream)
         except ReplyGenerationError:
             raise
         except (ClientError, BotoCoreError) as exc:
@@ -142,8 +150,14 @@ class BedrockReplyGenerator:
             logger.exception("Unexpected failure while streaming from Bedrock")
             raise ReplyGenerationError("The model reply failed.") from exc
 
-    def _start_stream(self, request: ChatRequest) -> Iterator[Any]:
-        """Open the response stream. Blocking, so callers run it off the loop."""
+    def _start_stream(self, request: ChatRequest) -> Any:
+        """Open the response stream. Blocking, so callers run it off the loop.
+
+        Returns botocore's ``EventStream`` rather than ``iter()`` of it: the
+        stream object owns the live HTTP response and is the only thing that
+        can close it, so wrapping it in a bare iterator here would throw away
+        the only handle on the socket.
+        """
         kwargs: dict[str, Any] = {
             "modelId": self._model_id,
             "messages": self._to_converse_messages(request),
@@ -156,7 +170,7 @@ class BedrockReplyGenerator:
             kwargs["system"] = [{"text": self._system_prompt}]
 
         response = self._client.converse_stream(**kwargs)
-        return iter(response["stream"])
+        return response["stream"]
 
     def _to_converse_messages(self, request: ChatRequest) -> list[dict[str, Any]]:
         """Render the request as a Converse ``messages`` list.
@@ -206,6 +220,24 @@ def _delta_text(event: dict[str, Any]) -> str:
     return text if isinstance(text, str) else ""
 
 
+def _close_quietly(stream: Any) -> None:
+    """Release the response socket, whatever else is going on.
+
+    Called from a ``finally`` while an exception may be in flight, so it must
+    never raise: a failure to tidy up is worth a log line and nothing more,
+    and must not replace the error that is already on its way out.
+
+    Deliberately synchronous rather than dispatched to a thread. Closing a
+    response hands back a socket; it does not wait on one. Awaiting here would
+    also mean awaiting while the generator is being closed, when the
+    surrounding cancel scope may already be gone.
+    """
+    try:
+        stream.close()
+    except Exception:  # tidying up must never mask a real failure
+        logger.warning("Could not close the Bedrock response stream", exc_info=True)
+
+
 async def _aiterate(iterator: Iterator[Any]) -> AsyncIterator[Any]:
     """Consume a blocking iterator without blocking the event loop.
 
@@ -216,6 +248,16 @@ async def _aiterate(iterator: Iterator[Any]) -> AsyncIterator[Any]:
     behind the slowest one. Each ``next()`` therefore goes to a worker thread.
 
     anyio rather than a new dependency: FastAPI already runs on it.
+
+    **This loop cannot be interrupted by a timeout.** ``run_sync`` defaults to
+    ``abandon_on_cancel=False``, which shields the await: a cancellation is
+    delivered only once the thread returns, so a ``fail_after`` around this
+    cannot fire while ``next()`` is waiting on a silent socket. The real bound
+    is the client's ``read_timeout``, which is why callers size their own
+    timeouts around it rather than assuming they can cut this short. Setting
+    ``abandon_on_cancel=True`` is worse, not better: the thread is abandoned
+    rather than stopped, and keeps a slot in anyio's limiter until the socket
+    gives up anyway.
     """
     sentinel = object()
 

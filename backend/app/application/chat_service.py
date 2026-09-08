@@ -50,10 +50,20 @@ class ChatService:
             InvalidPromptError: The prompt is blank or too long.
             ReplyGenerationError: Raised while iterating, if generation fails.
         """
-        self._validate(request)
+        self.validate(request)
         return self._generate(request)
 
-    def _validate(self, request: ChatRequest) -> None:
+    def validate(self, request: ChatRequest) -> None:
+        """Apply the prompt rules, raising rather than returning a verdict.
+
+        Public because the asynchronous path has to reject a bad request at
+        submit time, long before anything will iterate a reply. Keeping it here
+        rather than duplicating the rules is what stops the two paths from
+        disagreeing about what they accept.
+
+        Raises:
+            InvalidPromptError: The prompt is blank or too long.
+        """
         if not request.prompt.strip():
             raise InvalidPromptError("The prompt must not be empty.")
         if len(request.prompt) > self._max_prompt_chars:
