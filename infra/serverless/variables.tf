@@ -250,3 +250,144 @@ variable "bedrock_temperature" {
   type        = number
   default     = 0.7
 }
+
+variable "bedrock_read_timeout_seconds" {
+  description = <<-EOT
+    How long botocore waits on a silent Bedrock socket before giving up.
+
+    This is the real ceiling on how long a stalled reply occupies a worker, and
+    not for a reason anyone would guess: the adapter iterates botocore's
+    synchronous event stream on a worker thread, and such a call cannot be
+    interrupted by a timeout — a cancellation is delivered only once the thread
+    returns. So nothing in the application can cut a stalled read short, and
+    this number is what ends it.
+
+    Which is why `worker_timeout_seconds` must exceed it, enforced below.
+  EOT
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.bedrock_read_timeout_seconds >= 5 && var.bedrock_read_timeout_seconds <= 300
+    error_message = "bedrock_read_timeout_seconds must be between 5 and 300."
+  }
+}
+
+# ── asynchronous replies ──────────────────────────────────────────────────────
+#
+# The worker is the same image as the api function, deployed a second time and
+# mounted as a worker. Its sizing is separate because its job is: it runs for as
+# long as a reply takes, with nobody holding a connection open, where the api
+# function answers in milliseconds and streams.
+
+variable "worker_memory_size_mb" {
+  description = <<-EOT
+    Worker memory, which on Lambda also buys proportional CPU.
+
+    Starts equal to the api function's for the same reason — init is CPU-bound
+    and the measured cost is `Init Duration`, not working set. It is a separate
+    variable because the worker's cold start is the one a person actually waits
+    through on the asynchronous path, so it is the one worth raising first.
+  EOT
+  type        = number
+  default     = 1536
+
+  validation {
+    condition     = var.worker_memory_size_mb >= 512 && var.worker_memory_size_mb <= 10240
+    error_message = "worker_memory_size_mb must be between 512 and 10240. Below 512 the Python import cost dominates every invocation."
+  }
+}
+
+variable "worker_timeout_seconds" {
+  description = <<-EOT
+    Maximum worker duration, and the only thing that can stop a stalled reply.
+
+    The application does not enforce its own budget, deliberately: it cannot.
+    A worker blocked reading from Bedrock is uninterruptible (see
+    `bedrock_read_timeout_seconds`), so a timeout in application code would fail
+    to fire in precisely the case it existed for. Lambda's timeout is the real
+    mechanism, and a job killed by it is reported to the client by its deadline
+    rather than by the worker.
+
+    Longer than the api function's 120 s because a reply may legitimately take
+    longer than any HTTP client would wait — which is much of the point of
+    generating it out of band.
+  EOT
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.worker_timeout_seconds >= 120 && var.worker_timeout_seconds <= 900
+    error_message = "worker_timeout_seconds must be between 120 and 900."
+  }
+
+  validation {
+    condition     = var.worker_timeout_seconds > var.bedrock_read_timeout_seconds
+    error_message = "worker_timeout_seconds must exceed bedrock_read_timeout_seconds, or Lambda kills the worker while botocore is still legitimately waiting and the failure is reported as a timeout rather than as a stalled model."
+  }
+}
+
+variable "worker_event_age_seconds" {
+  description = <<-EOT
+    How long Lambda may keep retrying delivery of a job before discarding it.
+
+    This is the one thing genuinely given up by handing work to Lambda's own
+    event queue rather than to a queue of our own: an SQS message waits for up
+    to fourteen days, whereas an event older than this is **dropped**. Under a
+    sustained Bedrock throttle, jobs are retried across several backoff attempts
+    and then discarded, healed as failures, and the person is asked to resend.
+
+    300 s is a judgement about people rather than about AWS. The maximum is six
+    hours, but a chat reply that arrives fifteen minutes late is worthless — a
+    prompt "busy, try again" beats a silent wait nobody is still watching. Raise
+    it if `AsyncEventAge` shows deliveries routinely close to the limit.
+  EOT
+  type        = number
+  default     = 300
+
+  validation {
+    condition     = var.worker_event_age_seconds >= 60 && var.worker_event_age_seconds <= 21600
+    error_message = "worker_event_age_seconds must be between 60 and 21600 (six hours), the range Lambda accepts."
+  }
+}
+
+variable "job_retention_seconds" {
+  description = <<-EOT
+    How long a reply remains readable before its record expires.
+
+    One hour covers a page refresh, a dropped connection and a closed laptop
+    lid, which is the durability the asynchronous path exists to provide, while
+    keeping almost nothing at rest.
+
+    Note this sets the *expiry*, not the deletion. DynamoDB removes expired
+    items only typically within 48 hours of expiry, so the honest figure for how
+    long a reply is at rest is up to about 49 hours. Replies routinely quote the
+    question back, so treat the table as holding conversation content.
+  EOT
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.job_retention_seconds >= 300 && var.job_retention_seconds <= 604800
+    error_message = "job_retention_seconds must be between 300 (five minutes) and 604800 (a week)."
+  }
+}
+
+variable "worker_failure_retention_seconds" {
+  description = <<-EOT
+    How long a failed job's record stays on the failure queue.
+
+    Long enough to outlast a weekend, so an alarm that fires on a Friday can
+    still be acted on — and short enough to matter, because these records carry
+    the original prompt and conversation history. That is the one place this
+    design leaves user prompts at rest, and it is why the destination is a queue
+    in this account rather than the email topic the alarms use.
+  EOT
+  type        = number
+  default     = 345600
+
+  validation {
+    condition     = var.worker_failure_retention_seconds >= 60 && var.worker_failure_retention_seconds <= 1209600
+    error_message = "worker_failure_retention_seconds must be between 60 and 1209600 (fourteen days), the range SQS accepts."
+  }
+}

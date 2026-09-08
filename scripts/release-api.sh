@@ -1,9 +1,14 @@
 #!/bin/sh
 #
-# Release the api image: build, push, then point the function at the new bytes.
+# Release the api image: build, push, then point every function at the new bytes.
 #
 #   ./scripts/release-api.sh
 #   ./scripts/release-api.sh --skip-update    build and push only
+#
+# One image, two functions. The API and the worker that generates replies out of
+# band run the same bytes, so both are updated here — leaving one behind means
+# the API keeps working while every asynchronous job fails, which is a symptom
+# that points nowhere near a release.
 #
 # Terraform is not involved. It owns the environment and has no part in a
 # release, which is the same division ../infra/server keeps — there, a release is
@@ -22,7 +27,7 @@ for arg in "$@"; do
     case "$arg" in
         --skip-update) skip_update=1 ;;
         -h|--help)
-            sed -n '2,17p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+            sed -n '2,20p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
             exit 0
             ;;
         *) die "Unknown argument '$arg'. See --help." ;;
@@ -100,25 +105,46 @@ if [ "$skip_update" -eq 1 ]; then
     exit 0
 fi
 
-function_name=$(require_tf_output function_name)
+# Every function built from this image, not just the api one.
+#
+# One image runs twice — the API and the worker that generates replies out of
+# band — and both must move together. A release that updates one and not the
+# other is the worst failure this deployment can produce: the API keeps
+# answering, health checks keep passing, and every asynchronous job fails on a
+# payload the stale half cannot parse. Nothing about that points at the release.
+#
+# Read from the stack rather than listed here, so adding a function changes the
+# release without anyone having to remember to.
+function_names=$(require_tf_output function_names)
 
 # By digest, not by tag. It records exactly which bytes run — and it is also why
 # lambda.tf must ignore changes to image_uri, since the API will now report a
 # digest where the configuration says a tag.
-log "Pointing $function_name at $digest"
-aws lambda update-function-code \
-    --function-name "$function_name" \
-    --image-uri "$registry@$digest" \
-    --no-cli-pager \
-    --query 'LastUpdateStatus' \
-    --output text "$@"
+#
+# Updated in one pass and waited on in another, rather than update-and-wait per
+# function. Lambda re-optimises a container image on update and that takes tens
+# of seconds; starting both first means the two happen concurrently, and the
+# window in which the functions disagree is as short as it can be.
+# shellcheck disable=SC2086 # deliberate word splitting: one name per function.
+for function_name in $function_names; do
+    log "Pointing $function_name at $digest"
+    aws lambda update-function-code \
+        --function-name "$function_name" \
+        --image-uri "$registry@$digest" \
+        --no-cli-pager \
+        --query 'LastUpdateStatus' \
+        --output text "$@"
+done
 
 # A container-image update is not instant: Lambda re-optimises the image and goes
 # Pending, rejecting invocations until it is Active again. Without this wait the
 # script would exit "successfully" while the deployment is still broken, and the
 # next curl would fail for a reason that has nothing to do with the code.
-log "Waiting for the update to become Active"
-aws lambda wait function-updated --function-name "$function_name" "$@" \
-    || die "The function did not become Active. Check: $(tf_output api_log_command)"
+# shellcheck disable=SC2086 # deliberate word splitting: one name per function.
+for function_name in $function_names; do
+    log "Waiting for $function_name to become Active"
+    aws lambda wait function-updated --function-name "$function_name" "$@" \
+        || die "$function_name did not become Active. Check: $(tf_output api_log_command)"
+done
 
-log "Released $tag"
+log "Released $tag to $function_names"

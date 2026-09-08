@@ -44,6 +44,38 @@
 # bills the full duration and does not stop a stream when the viewer disconnects.
 # timeout_seconds = 120
 
+# ── Asynchronous replies ──────────────────────────────────────────────────────
+#
+# The worker is this same image, deployed a second time and mounted as a worker.
+# It runs for as long as a reply takes with nobody holding a connection open, so
+# it is sized separately from the API.
+
+# The worker's cold start is the one a person actually waits through on the
+# asynchronous path, and init is CPU-bound — so this is the first number to raise
+# if the wait is too long. Measure Init Duration in its REPORT lines first.
+# worker_memory_size_mb = 1536
+
+# The only thing that can stop a stalled reply. The application deliberately does
+# not enforce its own budget, because it cannot: a worker blocked reading from
+# Bedrock is uninterruptible, so an in-process timeout would fail to fire in
+# exactly the case it existed for. Must exceed bedrock_read_timeout_seconds,
+# which Terraform checks.
+# worker_timeout_seconds = 300
+
+# How long botocore waits on a silent Bedrock socket. This is the real ceiling on
+# how long a stalled reply occupies a worker.
+# bedrock_read_timeout_seconds = 60
+
+# How long Lambda may retry delivering a job before discarding it — the one thing
+# genuinely given up by using Lambda's event queue instead of running a queue.
+# Under a sustained throttle, jobs are retried and then dropped, surfacing to the
+# client as a deadline failure and to us as the worker-events-dropped alarm.
+#
+# 300 s is a judgement about people, not about AWS: the maximum is six hours, but
+# a reply arriving fifteen minutes late is worthless, and "busy, try again" beats
+# a silent wait. Raise it if AsyncEventAge shows deliveries near the limit.
+# worker_event_age_seconds = 300
+
 # ── Error alerts ──────────────────────────────────────────────────────────────
 
 # Where the two error alarms mail. Set the real value in terraform.tfvars next to
@@ -73,3 +105,18 @@
 
 # Bounds how long a billed — and possibly abandoned — stream can run.
 # bedrock_max_output_tokens = 1024
+
+# How long an asynchronous reply stays readable. One hour covers a page refresh,
+# a dropped connection and a closed laptop lid, which is the durability the
+# transport exists for, while keeping almost nothing at rest.
+#
+# This sets the *expiry*, not the deletion: DynamoDB removes expired items only
+# typically within 48 hours, so the honest figure for how long a reply is at rest
+# is up to about 49 hours. Replies routinely quote the question back.
+# job_retention_seconds = 3600
+
+# How long a failed job's record stays on the failure queue. Long enough to
+# outlast a weekend, so a Friday alarm can still be acted on — and no longer,
+# because these records carry the prompt and the conversation history. That is
+# the one place this design leaves them at rest.
+# worker_failure_retention_seconds = 345600
