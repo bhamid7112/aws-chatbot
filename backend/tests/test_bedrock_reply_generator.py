@@ -7,14 +7,14 @@ translates, the failures it converts — can be tested without AWS.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from typing import Any
+from collections.abc import AsyncGenerator, Iterator
+from typing import Any, cast
 
 import pytest
 from botocore.exceptions import ClientError, ConnectTimeoutError
 
 from app.application.chat_service import ChatService
-from app.domain.entities import ChatRequest, Message, Role
+from app.domain.entities import ChatRequest, Message, ReplyChunk, Role
 from app.domain.errors import ReplyGenerationError
 from app.domain.ports import ReplyGenerator
 from app.infrastructure.bedrock_reply_generator import BedrockReplyGenerator
@@ -22,6 +22,26 @@ from app.infrastructure.bedrock_reply_generator import BedrockReplyGenerator
 
 def _delta(text: str) -> dict[str, Any]:
     return {"contentBlockDelta": {"delta": {"text": text}}}
+
+
+class StubStream:
+    """Stands in for botocore's ``EventStream``.
+
+    It has a ``close`` because the real one does, and because the adapter is
+    required to call it: the stream owns a live HTTP response, and walking away
+    from a reply — which a cancelled asynchronous job does routinely — would
+    otherwise leak the socket.
+    """
+
+    def __init__(self, events: Iterator[dict[str, Any]]) -> None:
+        self._events = events
+        self.closed = False
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        return self._events
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class StubClient:
@@ -37,12 +57,14 @@ class StubClient:
         self._events = default if events is None else events
         self._error = error
         self.calls: list[dict[str, Any]] = []
+        self.stream: StubStream | None = None
 
-    def converse_stream(self, **kwargs: Any) -> dict[str, Iterator[dict[str, Any]]]:
+    def converse_stream(self, **kwargs: Any) -> dict[str, StubStream]:
         self.calls.append(kwargs)
         if self._error is not None:
             raise self._error
-        return {"stream": iter(self._events)}
+        self.stream = StubStream(iter(self._events))
+        return {"stream": self.stream}
 
 
 class FailingStream:
@@ -50,13 +72,15 @@ class FailingStream:
 
     def __init__(self, error: Exception) -> None:
         self._error = error
+        self.stream: StubStream | None = None
 
-    def converse_stream(self, **kwargs: Any) -> dict[str, Iterator[dict[str, Any]]]:
+    def converse_stream(self, **kwargs: Any) -> dict[str, StubStream]:
         def events() -> Iterator[dict[str, Any]]:
             yield _delta("Half a rep")
             raise self._error
 
-        return {"stream": events()}
+        self.stream = StubStream(events())
+        return {"stream": self.stream}
 
 
 def _client_error(code: str = "ValidationException") -> ClientError:
@@ -336,6 +360,49 @@ async def test_the_original_cause_is_chained_for_the_log() -> None:
         await _collect(generator, ChatRequest(prompt="x"))
 
     assert raised.value.__cause__ is original
+
+
+# ── the response stream is released ───────────────────────────────────────────
+
+
+async def test_closes_the_stream_when_the_reply_finishes() -> None:
+    client = StubClient()
+
+    await _collect(_make(client), ChatRequest(prompt="x"))
+
+    assert client.stream is not None
+    assert client.stream.closed
+
+
+async def test_closes_the_stream_when_the_consumer_walks_away() -> None:
+    """The case this exists for: a cancelled job stops reading mid-reply.
+
+    Without the close, every cancellation would abandon a live HTTP response
+    and leak its socket — and cancellation is a routine event on the
+    asynchronous path rather than a rare one.
+    """
+    client = StubClient([_delta("one"), _delta("two"), _delta("three")])
+    generator = _make(client)
+
+    # Typed as an AsyncIterator by the port; the adapter is an async
+    # generator, and closing it is what runs its cleanup.
+    replies = generator.generate(ChatRequest(prompt="x"))
+    stream = cast("AsyncGenerator[ReplyChunk, None]", replies)
+    assert await anext(stream) is not None
+    await stream.aclose()
+
+    assert client.stream is not None
+    assert client.stream.closed
+
+
+async def test_closes_the_stream_when_it_drops_mid_reply() -> None:
+    client = FailingStream(ConnectTimeoutError(endpoint_url="https://bedrock"))
+
+    with pytest.raises(ReplyGenerationError):
+        await _collect(_make(client), ChatRequest(prompt="x"))
+
+    assert client.stream is not None
+    assert client.stream.closed
 
 
 async def test_an_empty_stream_surfaces_through_the_use_case() -> None:

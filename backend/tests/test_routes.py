@@ -34,7 +34,17 @@ class TestHealth:
         response = client.get("/api/health")
 
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        assert response.json()["status"] == "ok"
+
+    def test_advertises_only_the_streamed_transport_by_default(
+        self, client: TestClient
+    ) -> None:
+        # No job store configured, so the asynchronous transport is not offered.
+        # The browser reads this to pick a transport, and one bundle is served
+        # by two deployment targets — only one of which has the job routes.
+        response = client.get("/api/health")
+
+        assert response.json()["transports"] == ["sse"]
 
 
 class TestChatStream:
